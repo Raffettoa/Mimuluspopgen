@@ -1,0 +1,7 @@
+import os
+
+os.chdir("C:/Users/akrap/Downloads/PCA")
+print("Current directory: ", os.getcwd())
+
+eigen_vec = "qtl_pca.eigenvec"
+print("Eigenvec file: ", eigen_vec)
