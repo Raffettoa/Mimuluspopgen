@@ -1,0 +1,342 @@
+#1: 1_index_refGenome : this makes the reference genome annotated so that the chromosomes are numbered
+
+#!/bin/tcsh
+#SBATCH --job-name=IndexGenome
+#SBATCH -N 1 --ntasks-per-node 20
+#SBATCH -t 5:00:00
+
+
+module load miniforge3/24.9.2-0
+conda activate mimulus
+
+set OUTDIR="1_genome_index"
+mkdir -p $OUTDIR
+
+set mimulus_ref = "/sciclone/data10/akraffetto/mimulustest/Mcupreus_genome/Mimulus_cupreus_MCY43.PRELIM.mainGenome.fasta"
+
+bowtie2-build $mimulus_ref $OUTDIR/Mimulus_cupreus> genome_indexing
+
+#2: 2_align_reads.sh : this requires the installation of bowtie2. What it does is take your samples and aligns them to the reference genome by mapping them to create a genome scaffold in order
+
+#!/usr/bin/env bash
+set -euo pipefail
+
+## ----- Settings ----------------------------
+NUM_CORES=6                                    		# Bowtie2 threads
+MAIN="/sciclone/data10/akraffetto/mimulustest"
+REF="$MAIN/1_genome_index/Mimulus_cupreus"      # Bowtie2 index basename (no extension)
+FASTQ="$MAIN/fastq"                             	# Folder with R1/R2 fastq(.gz)
+OUT="$MAIN/2-SAM-subset"                          	# Output SAM dir
+LOG="$MAIN/Log_align_to_CDS.txt"                	# Log file
+TEMPLATE=align_tmp.tcsh                         	# tcsh job template
+## ----- End of settings ---------------------
+
+mkdir -p "$OUT" "$(dirname "$LOG")"
+echo "Starting : $(date)" > "$LOG"
+
+
+for file in $FASTQ/*R1_001.fastq.gz; do
+    start_time=$(date +%s)
+    base=${file##*/}
+    
+    #####create a variable called R2 that is the filename of the r2 file corresponding to r1
+    R2=${file%R1_001.fastq.gz}R2_001.fastq.gz
+    ###END OF NEW CODE
+        
+    outfile=${base/.fastq.gz/.sam}
+    outfile=${outfile/.fastq/.sam}
+    outfile=$OUT/$outfile
+    sample_name=$(basename "$file" "R1_001.fastq.gz")
+    sample_name=$(echo "$sample_name" | cut -d"_" -f2)
+    echo $sample_name
+
+    
+    ## Run bowtie
+    cat align_tmp.tcsh \
+    | sed "s,@@NUM_CORES@@,$NUM_CORES,g" \
+    | sed "s,@@REF@@,$REF,g" \
+    | sed "s,@@file@@,$file,g" \
+    | sed "s,@@R2@@,$R2,g" \
+    | sed "s,@@outfile@@,$outfile,g" \
+    | sed "s,@@LOG@@,$LOG,g" \
+    | sed "s,@@sample_name@@,$sample_name,g" \
+    | sed "s,@@start_time@@,$start_time,g" \
+    | sbatch
+done
+
+echo 'Process complete : ' $(date) >> $LOG
+
+------------------------------------------------------------------------------------------------------------------------------------- #2 will call on 2.5, this file below align_tmp.tcsh
+#!/bin/tcsh
+#SBATCH --job-name=@@sample_name@@
+#SBATCH -N 1
+#SBATCH --ntasks-per-node 10
+#SBATCH -t 48:00:00
+
+module load miniforge3/24.9.2-0
+conda activate mimulus
+
+# Optional: derive NUM_CORES for tools that need -p
+# Emmanuel: changed parameter from --very-sensitive-local to --fast-local
+
+set start_time = `date +%s`
+set file = @@file@@
+set REF = @@REF@@
+set R2 = @@R2@@
+set outfile = @@outfile@@
+set LOG = @@LOG@@
+
+echo 'Current R1 file:\t\t' $file
+echo 'Current R2 file:\t\t' $R2
+echo 'Output will be:\t\t' $outfile
+
+bowtie2 -p @@NUM_CORES@@ \
+    --local --fast-local \
+    -x $REF \
+    -1 "$file" -2 "$R2" \
+    -S "$outfile" \
+    || echo "Something went wrong with file " $file >> $LOG
+
+
+set end_time = `date +%s`
+@ elapsed_time = $end_time - $start_time
+@ hours = $elapsed_time / 3600
+@ minutes = ( $elapsed_time % 3600 ) / 60
+@ seconds = $elapsed_time % 60
+echo "Script execution time: $hours hours, $minutes minutes, and $seconds seconds."
+
+echo $file ' : ' `(date)` >> $LOG
+
+#3 3_filter_reads.sh : this will filter the files to get rid of stuff that doesn’t align well
+ 
+#!/usr/bin/env bash
+set -euo pipefail
+ 
+## ----- Settings ----------------------------
+MAIN="/sciclone/data10/akraffetto/mimulustest"       
+MAPPED_OUTDIR="$MAIN/3-SAM-TO-BAM"
+SAM_FILES="$MAIN/2-SAM-subset"                     # Input SAM dir
+LOG="$MAIN/Log_filter_sam.txt"                           # Log file
+## ----- End of settings ---------------------
+ 
+echo "Starting : $(date)" > "$LOG"
+mkdir -p $MAPPED_OUTDIR
+ 
+for file in $SAM_FILES/*.sam; do
+    start_time=$(date +%s)
+    base=${file##*/}
+ 
+    outfile=${base/_R1_001.sam/.bam}
+    MAPPED_OUT="$MAPPED_OUTDIR/$outfile"
+    sample_name=$(echo "$file" | cut -d"_" -f1)
+    
+    ## Run samtools view
+    cat filter_SAM.sh \
+    | sed "s,@@input_sam@@,$file,g" \
+    | sed "s,@@MAPPED_OUT@@,$MAPPED_OUT,g" \
+    | sed "s,@@sample_name@@,$sample_name,g" \
+    | sbatch
+done
+ 
+echo 'Process complete : ' $(date) >> $LOG
+
+#5 filter_SAM.sh : should convert the sam files into bam files. (if needed)
+
+#!/bin/tcsh
+#SBATCH --job-name=@@sample_name@@
+#SBATCH -N 1 --ntasks-per-node 10
+#SBATCH -t 10:00:00
+
+
+module load miniforge3/24.9.2-0
+conda activate mimulus
+
+# Save sam files as bam format
+samtools view -bS @@input_sam@@ > @@MAPPED_OUT@@
+
+#6 alignment_stats.sh : this is a subscript and will be called upon by 4_sort_index_reads.sh
+
+#!/bin/tcsh
+#SBATCH --job-name=@@sample_name@@
+#SBATCH -N 1 --ntasks-per-node 10
+#SBATCH -t 10:00:00
+
+
+module load miniforge3/24.9.2-0
+conda activate mimulus
+
+
+# If alignment files were not saved in BAM format, execute code below
+# samtools view -bS your_alignments.sam > your_alignments.bam
+
+samtools sort @@input_bam@@ -o @@sorted_bam@@
+
+samtools index @@sorted_bam@@
+
+samtools idxstats --threads @@threads@@ @@sorted_bam@@ > @@count_sorted@@
+
+#7 4_sort_index_reads.sh : sort them, count them and filter them and make that info known in a file
+
+#!/bin/env bash
+
+MAIN="/sciclone/data10/akraffetto/mimulustest" 		# Make it easier. Work in the same directory as the other files.
+INPUT_BAM="$MAIN/3-SAM-TO-BAM"			# Location of BAM files after containing only filtered reads that map
+SORT_INDEX_DIR="$MAIN/3-SORT-AND-INDEX/1-SORT-INDEX" 	# Store index and sort files here
+STATS="$MAIN/3-SORT-AND-INDEX/2-STATS" 			# Stats are stored here
+THREADS=20						# This depends on the number of cores being used in the job
+
+# Make sure these folders exist
+mkdir -p $SORT_INDEX_DIR
+mkdir -p $STATS
+
+
+for sample in $INPUT_BAM/*.bam; do
+
+	start_time=$(date +%s)
+	name_prefix=$(basename "$sample")
+	sorted_bam="$SORT_INDEX_DIR/$name_prefix"
+	counts="$STATS/$name_prefix.txt"
+	sample_name=$(basename "$file")
+
+	cat alignment_stats.sh \
+ 	| sed "s,@@input_bam@@,$sample,g" \
+	| sed "s,@@sorted_bam@@,$sorted_bam,g" \
+	| sed "s,@@count_sorted@@,$counts,g" \
+	| sed "s,@@sample_name@@,$sample_name,g" \
+	| sed "s,@@threads@@,$THREADS,g" \
+	| sbatch
+Done
+
+#4: Custom commands. May have to load samtools
+
+#read inside whatever folder has bam files
+realpath * > bamfiles.txt
+realpath 2-SAM-subset/* > bamfiles.txt
+#run the next line outside of the 2-sam-subset folder
+Samtools faidx Mimulus_cupreus put (filename here) .fasta
+
+
+#8 6_run_mpileup.sh : requires bcftools, may have to install. This script creates the vcf files as an output
+
+#!/bin/tcsh
+#SBATCH --job-name=bcftools
+#SBATCH -N 1
+#SBATCH --ntasks-per-node 20
+#SBATCH -t 72:00:00
+
+module load miniforge3/24.9.2-0
+conda activate mimulus
+
+set BAMFILES="bamfiles.txt" # Each line in the file corresponds to a single BAM file.
+set REF_FASTA="/sciclone/data10/akraffetto/mimulustest/Mcupreus_genome/Mimulus_cupreus_MCY43.PRELIM.mainGenome.fasta" # Indexed Ref FASTA
+set THREADS=30
+set OUT_DIR="6-MPILEUP"
+
+# Remove -r line if bam files do not contain any alignments apart from the reference genome
+# I had to do this because I initially aligned reads against the ref_genome+mito+chloroplast
+
+bcftools mpileup -Ou \
+  -f $REF_FASTA \
+  -b $BAMFILES \
+  -q 20 \
+  -Q 20 \
+  -a AD,DP,SP \
+  --threads $THREADS \
+| bcftools call -mv -Ou --threads $THREADS \
+| bcftools view -Ou -m2 -M2 -v snps \
+| bcftools norm -f $REF_FASTA -Oz -o $OUT_DIR/mimulus_snps.vcf.gz
+
+# Run checks on vcf file
+# Output should be a subdirectory in 6-MPILEUP
+
+#9 7_run_filters.sh : this filters out things like insertions and deletions, or things that are missing or where the quality is low. 
+
+#!/bin/tcsh
+#SBATCH --job-name=vcf_filters
+#SBATCH -N 1
+#SBATCH --ntasks-per-node 32
+#SBATCH -t 48:00:00
+
+
+module load miniforge3/24.9.2-0
+conda activate mimulus
+
+set INPUT_VCF="6-MPILEUP/mimulus_snps.vcf.gz"
+set VCF_OUTPUT="7-VCF-OUTPUT"
+mkdir -p $VCF_OUTPUT
+
+set out1="1_remove_indels"
+set out2="2_remove_missing"
+set out3="3_remove_mdepth"
+set out4="4_remove_genequal"
+set out5="5_remove_indels2"
+set out6="6_remove_maf"
+
+echo "## Remove indels"
+vcftools --gzvcf $INPUT_VCF --remove-indels --recode --recode-INFO-all --out $out1
+
+echo "\n\t## Filter out sites with missing data"
+# Exclude sites on the basis of the proportion of missing data
+# (defined to be between 0 and 1, where 0 allows sites that are completely missing
+# and 1 indicates no missing data allowed)
+vcftools --vcf "$out1.recode.vcf" --max-missing 0.7 --recode --recode-INFO-all --out $out2
+
+echo "\n\t## Filter minimum depth of coverage"
+vcftools --vcf "$out2.recode.vcf" --min-meanDP 2 --recode --recode-INFO-all --out $out3
+
+echo "\n\t## Filter out minimum Genotype Quality"
+vcftools --vcf "$out3.recode.vcf" --minGQ 20 --recode --recode-INFO-all --out $out4
+
+#echo "\n\t## Remove indels again"
+#vcftools --vcf "$out4.recode.vcf" --remove-indels --recode --recode-INFO-all --out $out5
+
+echo "\n\t## Remove minor allelic frequencies"
+vcftools --vcf "$out4.recode.vcf" --maf 0.05 --recode --recode-INFO-all --out $out6
+
+echo "\n\t## Done Filtering file: $INPUT_VCF"
+echo "\n\t## Moving vcf files to: $VCF_OUTPUT"
+mv *remove*.vcf "$VCF_OUTPUT/"
+
+date
+
+#10 8_run_plink.sh : takes your vcf files and analyzes the SNP's to create a pca output. Should be able to get to files, the eigenval and eigenvec, which you can then turn into a pca. 
+
+#!/bin/tcsh
+#SBATCH --job-name=runPLINK
+#SBATCH -N 1
+#SBATCH --ntasks-per-node 20
+#SBATCH -t 48:00:00
+
+module load miniforge3/24.9.2-0
+conda activate mimulus
+
+set PLINK_OUTPUT="8-PLINK-OUT"
+mkdir -p $PLINK_OUTPUT
+
+# Make BED file from vcf file: contains QTL data
+echo "##\n\tMaking BED file "
+plink --vcf 7-VCF-OUTPUT/6_remove_maf.recode.vcf --allow-extra-chr --chr-set 31 --make-bed --out qtl_out
+
+# Run this if you are not getting any pca outputs: --mind 0.9 [removes samples with >90% missing genotypes]
+echo "##\n\tRemove samples with missing genotypes "
+plink --bfile qtl_out --mind 0.9 --make-bed --allow-extra-chr --chr-set 31 --out qtl_filtered
+
+# Prune filtered dataset
+echo "##\n\tPrune dataset "
+plink --bfile qtl_filtered --indep-pairwise 50 10 0.1 --allow-extra-chr --chr-set 31 --out qtl_pruned
+
+# Extract pruned SNPs
+echo "##\n\tExtract pruned SNPs "
+plink --bfile qtl_filtered --extract qtl_pruned.prune.in --allow-extra-chr --chr-set 31 --make-bed --out qtl_pruned2
+
+# Run PCA
+echo "##\n\tRun PCA "
+
+plink --bfile qtl_pruned2 --pca 10 --allow-extra-chr --chr-set 31 --out qtl_pca
+
+echo "##\n\tMoving all quantitative TL files to: $PLINK_OUTPUT"
+mv qtl* $PLINK_OUTPUT
+
+
+# To see which samples have no genotypes. Run this before the final pca code
+# plink --bfile qtl_out_pruned --missing --allow-extra-chr --out missingness
