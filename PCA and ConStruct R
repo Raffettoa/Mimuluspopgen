@@ -1,1 +1,114 @@
+library(ggplot2)
+
+eigen_vec <- read.csv("cleaned_qtl_pca.eigenvec")
+eigen_val <- read.csv("qtl_pca.eigenval", header = FALSE)
+sp <- read.csv("Species.csv")
+
+
+colnames(eigen_vec) <- c("name2", "PC1", "PC2", "PC3", "PC4", "PC5", "PC6", "PC7", "PC8", "PC9", "PC10")
+
+# Convert eigenvals to percentages
+eigen_per <- eigen_val / sum(eigen_val) * 100
+
+# make axis labels
+pc1_lab <- paste("PC1 (", round(eigen_per[[1, 1]], 2), "%)", sep = "")
+pc2_lab <- paste("PC2 (", round(eigen_per[[2, 1]], 2), "%)", sep = "")
+
+# Make scatterplot by species
+
+ggplot(eigen_vec, aes(x = PC1, y = PC2, color = sp$Species)) +
+  geom_point(size = 2.5) + labs(x = pc1_lab, y = pc2_lab) +
+  scale_color_manual(
+    name = "Species Identity", # Legend title
+    values = c(
+"c" = "darkgoldenrod1", "g" = "darkslategray3", "l" = "darkorchid2", "n" = "darkgreen", "u" = "red"), 
+    labels = c("cupreus", "glabratus", "luteus", "nasutus", "unknown")) + theme_minimal()
+  
+# Make scatterplot by geography
+
+ggplot(eigen_vec, aes(x = PC1, y = PC2, color = sp$Region)) +
+  geom_point(size = 2.5) + labs(x = pc1_lab, y = pc2_lab)  +
+  scale_color_manual(
+    name = "Region", # Legend title
+    values = c(
+      "North" = "aquamarine3", "South" = "salmon1"), 
+    labels = c("North", "South")) + theme_minimal()
+
+ConStruct: First line of code, add it to the 8_plink file before the PCA code. You will get out a file called plink. Recode. Strct.in ---------------------------------------------------------------------------------
+
+###convert to structure format
+plink --bfile qtl_pruned2 --recode structure --double-id --allow-extra-chr --chr-set 31
+
+#this is the code to run (IN R) to get a conStruct file:
+freq <- structure2conStruct(infile = "tiny_random200.strct_in",
+                           onerowperind = TRUE,
+                           start.loci = 1,
+                           start.samples = 3,
+                           missing.datum = 0,
+                           outfile = "test_cons.construct")
+
+#processing the coordinate database, as well as the geodist matrix of distance between each point
+temp = read.csv("Geo.txt", sep=",",header=FALSE)
+colnames(temp) <- c("Lon", "Lat")
+geo<-data.matrix(temp)
+geo
+
+install.packages('distGeo')
+dist <- geosphere::distm(geo)
+dist
+
+##running a non-spatial model
+Q30_run_20k <- conStruct(spatial = FALSE,
+                          K = 2,
+                          freqs = freq,
+                          geoDist = NULL,
+                          coords = geo,
+                          n.chains=1,
+                          n.iter=20000,
+                          prefix = "Q30_run_20k")
+
+
+#saveRDS(STR_k2_i1000_delta95, file = "STR_k2_i1000_delta95.RDS")
+#how to reload
+#All_m90_maf01_i2000 <- readRDS("All_m90_maf01_i2000")
+
+admix.props <- Q30_run_20k$chain_1$MAP$admix.proportions
+admix.props
+
+admix_df <- as.data.frame(admix.props)
+# Optional: Rename columns
+colnames(admix_df) <- c("Cluster1", "Cluster2")
+# Write to CSV
+write.csv(admix_df, file = "Q30_run_20k.csv", row.names = FALSE)
+
+df <- read.csv("Q30_run_20k.csv")
+cluster_matrix <- as.matrix(df[, c("Cluster1", "Cluster2")])
+cluster_matrix
+
+pdf("Q30_run_20k.pdf", width = 20, height = 8)
+make.structure.plot(admix.proportions = cluster_matrix,
+                    layer.colors = c("forestgreen","lightblue","red"),
+                    sample.names = df$Species)
+
+# Close the PDF device to save the file
+dev.off()
+
+
+df$clustermax <- pmax(df$Cluster1, df$Cluster2)
+df
+df_filtered <- df[df$clustermax <= .99, ]
+
+
+MAKING A GEOGRAPHIC DISTANCE MATRIX RANDOMLY WITHOUT SACRIFICING THE GENERAL LOCATION THEY WERE REALLY COLLECTED FROM -----------------------------------------------------------------
+
+temp = read.csv("Geo.csv", header = TRUE)
+colnames(temp) <- c("Lon", "Lat")
+geo<-data.matrix(temp)
+
+set.seed(21)
+num = rnorm(120, mean = 0, sd = 0.09)
+
+newgeo <- geo + num
+
+plot(newgeo, xlim = c(-72,-70), ylim = c(-38, -34))
 
