@@ -5,3 +5,32 @@ print("Current directory: ", os.getcwd())
 
 eigen_vec = "qtl_pca.eigenvec"
 print("Eigenvec file: ", eigen_vec)
+
+def clean_file(eigen_vec_file):
+	sample_names = []
+	# populate list with sample names alone and pca axis
+	with open(eigen_vec, "r") as infile:
+		for line in infile:
+			sample_name = line.split("/")[-1]
+			sample_names.append(sample_name)
+	# strip off file name extension
+	print("Stripping off file name extensions")
+	for idx, sample in enumerate(sample_names):
+		data = sample.split()
+		name = data[0].strip(".bam")
+		data[0] = name
+		sample_names[idx] = data
+
+	sample_names = [", ".join(sample) for sample in sample_names]
+	
+	outfile_name = "cleaned_qtl_pca.eigenvec"
+	print("Writing to file: ", outfile_name)
+	with open(outfile_name, "w") as outfile:
+		for line in sample_names:
+			outfile.write(line+"\n")
+	return
+
+
+if __name__ == "__main__":
+	clean_file(eigen_vec)
+
