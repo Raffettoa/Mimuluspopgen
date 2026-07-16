@@ -1,0 +1,849 @@
+#REMOVING INDIVIDUALS, AND PREPPING FOR POPULATION STATISTICS (PI, FST, DXY)------------------------------------------------------------------------------------------------------------------------------
+
+#!/bin/tcsh
+#SBATCH --job-name=bcftools
+#SBATCH -N 1
+#SBATCH --ntasks-per-node 20
+#SBATCH -t 72:00:00
+
+module load miniforge3/24.9.2-0
+conda activate mimulus
+
+set BAMFILES="bamfiles.txt" # Each line in the file corresponds to a single BAM file.
+set REF_FASTA="/sciclone/data10/akraffetto/mimulustest/Mcupreus_genome/Mimulus_cupreus_MCY43.PRELIM.mainGenome.fasta" # Indexed Ref FASTA
+set THREADS=30
+set OUT_DIR="6-MPILEUP"
+
+# this code starts with the fasta and converts it into a vcf. With the v missing and the m2 and the -v snps, this output will be a large mimulus_invar.vcf.gz WITH INVARIANT SITES
+bcftools mpileup -Ou \
+  -f $REF_FASTA \
+  -b $BAMFILES \
+  -q 20 \
+  -Q 20 \
+  -a AD,DP,SP \
+  --threads $THREADS \
+| bcftools call -m -Ou --threads $THREADS \
+| bcftools view -Ou -M2 \
+| bcftools norm -f $REF_FASTA -Oz -o $OUT_DIR/mimulus_invar.vcf.gz
+
+# Run checks on vcf file
+# Output should be a subdirectory in 6-MPILEUP
+
+#7 7_rm_others.sh -------------------------NEXT RUN THIS CODE. This filters, keeps invariants, outputs a file of missing data.
+#!/bin/tcsh
+#SBATCH --job-name=vcf_filters
+#SBATCH -N 1
+#SBATCH --ntasks-per-node 32
+#SBATCH -t 48:00:00
+
+
+module load miniforge3/24.9.2-0
+conda activate mimulus
+
+set INPUT_VCF="6-MPILEUP/mimulus_snps.vcf.gz"
+set VCF_OUTPUT="7-VCF-OUTPUT"
+mkdir -p $VCF_OUTPUT
+
+set out1="popgenfiltered"
+
+echo "## filter out stuff. NO maf filter, because it removes invariant sites"
+vcftools --gzvcf $INPUT_VCF --remove others.txt --remove-indels --max-missing 0.9 --min-meanDP 5 --minGQ 30 --recode --recode-INFO-all --out $out1
+vcftools --vcf popgenfiltered.recode.vcf --missing-indv --out STUFFMISSING
+
+bgzip popgenfiltered.recode.vcf
+
+
+	date
+
+
+zip.sh NEXT RUN THIS (you'll know it works when the slurm output message outputs nothing but the date). This should output a zipped and then tabbed indexed vcf
+
+#!/bin/tcsh
+#SBATCH --job-name=vcf_filters
+#SBATCH -N 1
+#SBATCH --ntasks-per-node 32
+#SBATCH -t 48:00:00
+
+
+module load miniforge3/24.9.2-0
+conda activate mimulus
+
+
+bgzip southcl.recode.vcf
+tabix southcl.recode.vcf.gz
+
+
+	date
+
+#9 9_stats THIS RUNS THE PIXY COMMANDS AND GIVES AN OUTPUT. NEXT IT HAS TO BE RUN IN R TO PLOT THE VALUES ACROSS THE GENOME ETC.
+#!/bin/tcsh
+#SBATCH --job-name=vcf_filters2
+#SBATCH -N 1
+#SBATCH --ntasks-per-node 32
+#SBATCH -t 48:00:00
+
+
+module load miniforge3/24.9.2-0
+conda activate pixy
+
+pixy --stats pi fst dxy --vcf popgenfiltered.recode.vcf.gz --populations nspixy.txt --window_size 10000 --output_folder 9-STATS
+
+#R code in order to get graphs for pixy output
+pixy_to_long <- function(pixy_files){
+  
+  pixy_df <- list()
+  
+  for(i in 1:length(pixy_files)){
+    
+    stat_file_type <- gsub(".*_|.txt", "", pixy_files[i])
+    
+    if(stat_file_type == "pi"){
+      
+      df <- read_delim(pixy_files[i], delim = "\t")
+      df <- df %>%
+        gather(-pop, -window_pos_1, -window_pos_2, -chromosome,
+               key = "statistic", value = "value") %>%
+        rename(pop1 = pop) %>%
+        mutate(pop2 = NA)
+      
+      pixy_df[[i]] <- df
+      
+      
+    } else{
+      
+      df <- read_delim(pixy_files[i], delim = "\t")
+      df <- df %>%
+        gather(-pop1, -pop2, -window_pos_1, -window_pos_2, -chromosome,
+               key = "statistic", value = "value")
+      pixy_df[[i]] <- df
+      
+    }
+    
+  }
+  
+  bind_rows(pixy_df) %>%
+    arrange(pop1, pop2, chromosome, window_pos_1, statistic)
+  
+}
+
+pixy_folder <- "output"
+pixy_files <- list.files(pixy_folder, full.names = TRUE)
+pixy_df <- pixy_to_long(pixy_files)
+
+
+
+
+# custom labeller for special characters in pi/dxy/fst
+pixy_labeller <- as_labeller(c(avg_pi = "pi",
+                               avg_dxy = "D[XY]",
+                               avg_wc_fst = "F[ST]"),
+                             default = label_parsed)
+
+# plotting summary statistics along a single chromosome
+pixy_df %>%
+  filter(chromosome == "Chr08A") %>%
+  filter(statistic %in% c("avg_pi", "avg_dxy", "avg_wc_fst")) %>%
+  mutate(chr_position = ((window_pos_1 + window_pos_2)/2)/1000000) %>%
+  ggplot(aes(x = chr_position, y = value, color = statistic))+
+  geom_line(size = 0.25)+
+ 
+  facet_grid(statistic ~ .,
+             scales = "free_y", switch = "x", space = "free_x",
+             labeller = labeller(statistic = pixy_labeller,
+                                 value = label_value))+
+  
+  xlab("Position on Chromosome (Mb)")+
+  ylab("Statistic Value")+
+  theme_bw()+
+  theme(panel.spacing = unit(0.1, "cm"),
+        strip.background = element_blank(),
+        strip.placement = "outside",
+        legend.position = "none")+
+  scale_x_continuous(expand = c(0, 0))+
+  scale_y_continuous(expand = c(0, 0))+
+  scale_color_brewer(palette = "Set1")
+
+
+
+# plotting summary statistics across all chromosomes
+
+pixy_df %>%
+  filter(statistic %in% c("avg_pi", "avg_dxy", "avg_wc_fst")) %>%
+  mutate(chr_type = ifelse(grepl("A$", chromosome), "A", "B")) %>%
+  ggplot(aes(x = (window_pos_1 + window_pos_2)/2, y = value, 
+             color = chr_type))+
+  geom_point(size = 0.5, alpha = 0.5, stroke = 0)+
+  facet_grid(statistic ~ chromosome,
+             scales = "free_y", switch = "x", space = "free_x",  
+             labeller = labeller(statistic = pixy_labeller,value = label_value))+ 
+  
+  xlab("Chromosome")+
+  ylab("Statistic Value")+
+  theme_classic()+
+  theme(axis.text.x = element_blank(),      # Remove x-axis text
+        axis.ticks.x = element_blank(),     # Remove x-axis ticks
+        panel.spacing = unit(0.1, "cm"),
+        strip.background = element_blank(),
+        strip.placement = "outside",
+        legend.position = "none")+
+  scale_x_continuous(expand = c(0, 0)) +
+  scale_y_continuous(expand = c(0, 0), limits = c(0, NA)) +
+  scale_color_manual(values = c("A" = "#003366", "B" = "#c17a3a"))
+
+  # Calculate averages for a subset of chromosomes
+  # Define your chromosome subset
+chromosomes_to_include <- c("Chr01A", "Chr02A", "Chr03A", "Chr04A", "Chr05A", "Chr06A", "Chr07A", "Chr08A", "Chr09A", "Chr10A", "Chr11A", "Chr12A", "Chr13A", "Chr14A", "Chr15A") 
+chromosomes_to_include <- c("Chr01B", "Chr02B", "Chr03B", "Chr04B", "Chr05B", "Chr06B", "Chr07B", "Chr08B", "Chr09B", "Chr10B", "Chr11B", "Chr12B", "Chr13B", "Chr14B", "Chr15B", "Chr16B")
+# Calculate genome-wide averages for the subset
+pixy_summary <- pixy_df %>%
+  filter(chromosome %in% chromosomes_to_include) %>%
+  group_by(statistic) %>%
+  summarise(
+    mean_value = mean(value, na.rm = TRUE),
+    median_value = median(value, na.rm = TRUE),
+    sd_value = sd(value, na.rm = TRUE),
+    n_windows = n(),
+    
+  )
+
+# View the results
+print(pixy_summary)
+
+
+
+
+
+# Create CDFs for Dxy across all chromosomes (A vs B)
+dxy_cdf <- pixy_df %>%
+  filter(statistic == "avg_dxy") %>%
+  mutate(chr_type = ifelse(grepl("A$", chromosome), "A", "B")) %>%
+  ggplot(aes(x = value, color = chr_type)) +
+  stat_ecdf(size = 1) +
+  labs(title = "Cumulative Distribution of D[XY]",
+       x = expression(D[XY]~value),
+       y = "Cumulative Probability",
+       color = "Subgenome") +
+  theme_classic() +
+  scale_color_manual(values = c("A" = "#c17a3a", "B" = "#1f4788"))
+
+print(dxy_cdf)
+
+
+
+# Get chromosome numbers (without A/B suffix)
+chr_numbers <- unique(gsub("A$|B$", "", pixy_df$chromosome))
+
+# For Pi - create a plot for each chromosome pair
+pi_plots <- lapply(chr_numbers, function(chr_num) {
+  
+  # Calculate shared x-axis limits for this chromosome pair
+  data_subset <- pixy_df %>%
+    filter(statistic == "avg_pi",
+           grepl(paste0("^", chr_num), chromosome))
+  
+  # Use quantiles to avoid extreme outliers
+  xlim_max <- quantile(data_subset$value, 0.99, na.rm = TRUE)  # 99th percentile
+  
+  data_subset %>%
+    mutate(chr_type = ifelse(grepl("A$", chromosome), "A", "B")) %>%
+    ggplot(aes(x = value, color = chr_type)) +
+    stat_ecdf(size = 1) +
+    labs(title = paste0("CDF of π - Chromosome ", chr_num),
+         x = "π value",
+         y = "Cumulative Probability",
+         color = "Subgenome") +
+    theme_classic() +
+    scale_color_manual(values = c("A" = "#1f4788", "B" = "#c17a3a")) +
+    coord_cartesian(xlim = c(0, xlim_max))  # Set x-axis limits
+  
+})
+
+# Print all pi plots
+for(i in seq_along(pi_plots)) {
+  print(pi_plots[[i]])
+}
+
+# For Dxy - create a plot for each chromosome pair
+dxy_plots <- lapply(chr_numbers, function(chr_num) {
+  
+  # Calculate shared x-axis limits for this chromosome pair
+  data_subset <- pixy_df %>%
+    filter(statistic == "avg_dxy",
+           grepl(paste0("^", chr_num), chromosome))
+  
+  # Use quantiles to avoid extreme outliers
+  xlim_max <- quantile(data_subset$value, 0.99, na.rm = TRUE)  # 99th percentile
+  
+  data_subset %>%
+    mutate(chr_type = ifelse(grepl("A$", chromosome), "A", "B")) %>%
+    ggplot(aes(x = value, color = chr_type)) +
+    stat_ecdf(size = 1) +
+    labs(title = paste0("CDF of D[XY] - Chromosome ", chr_num),
+         x = expression(D[XY]~value),
+         y = "Cumulative Probability",
+         color = "Subgenome") +
+    theme_classic() +
+    scale_color_manual(values = c("A" = "#1f4788", "B" = "#c17a3a")) +
+    coord_cartesian(xlim = c(0, xlim_max))  # Set x-axis limits
+  
+})
+
+# Print all dxy plots
+for(i in seq_along(dxy_plots)) {
+  print(dxy_plots[[i]])
+}
+
+
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(patchwork)  
+})
+
+# ─── PARAMETERS ──────────────────────────────────────────────────────────────
+
+# Population labels
+POP1 <- "L"
+POP2 <- "C"
+
+# Window size used in pixy run (for axis labels only)
+WINDOW_SIZE <- 5000
+
+# Quality filters
+MIN_SITES <- 500    # min callable sites per window for Pi and Dxy
+MIN_SNPS  <- 5      # min SNPs per window for Fst
+# (smaller thresholds than default due to 5kb windows at low depth)
+
+# Output directory for comparison results
+OUTDIR <- "9-STATS-comparison"
+dir.create(OUTDIR, showWarnings = FALSE)
+
+
+# ─── CANDIDATE REGIONS ───────────────────────────────────────────────────────
+
+candidates <- tribble(
+  ~chrom,   ~start,    ~end,      ~region_name,
+  "Chr09B", 5e6,  7e6,  "Chr12Binversplot"
+)
+
+if (any(is.na(candidates$start) | is.na(candidates$end))) {
+  stop("Fill in candidate region coordinates before running (see 'candidates' block above).")
+}
+
+# ─── LOAD PIXY OUTPUT ────────────────────────────────────────────────────────
+# When using --output_folder without --output_prefix, pixy names files:
+#   pixy_pi.txt, pixy_dxy.txt, pixy_fst.txt
+
+pi  <- read_tsv("pixy_pi.txt",  show_col_types = FALSE)
+dxy <- read_tsv("pixy_dxy.txt", show_col_types = FALSE)
+fst <- read_tsv("pixy_fst.txt", show_col_types = FALSE)
+
+# ─── FILTER BY QUALITY AND POPULATION PAIR ───────────────────────────────────
+
+pi_cup <- pi  |> filter(pop == POP1,                          no_sites >= MIN_SITES)
+pi_lut <- pi  |> filter(pop == POP2,                          no_sites >= MIN_SITES)
+dxy_f <- dxy |> filter(pop1 == POP1, pop2 == POP2, !is.na(avg_dxy))
+fst_f <- fst |> filter(pop1 == POP1, pop2 == POP2, !is.na(avg_wc_fst))
+
+message(sprintf("Windows after filtering — Pi_cup: %d  Pi_lut: %d  Dxy: %d  Fst: %d",
+                nrow(pi_cup), nrow(pi_lut), nrow(dxy_f), nrow(fst_f)))
+
+
+# ─── ANNOTATE CANDIDATE WINDOWS ──────────────────────────────────────────────
+
+label_windows <- function(df, cands, chrom_col = "chromosome") {
+  df$in_candidate    <- FALSE
+  df$candidate_region <- NA_character_
+  for (i in seq_len(nrow(cands))) {
+    hit <- df[[chrom_col]] == cands$chrom[i] &
+      df$window_pos_1  <  cands$end[i]  &
+      df$window_pos_2  >  cands$start[i]
+    df$in_candidate[hit]     <- TRUE
+    df$candidate_region[hit] <- cands$region_name[i]
+  }
+  df
+}
+
+pi_cup <- label_windows(pi_cup, candidates)
+pi_lut <- label_windows(pi_lut, candidates)
+dxy_f  <- label_windows(dxy_f,  candidates)
+fst_f  <- label_windows(fst_f,  candidates)
+
+message(sprintf("Candidate windows flagged — Pi_cup: %d  Pi_lut: %d  Dxy: %d  Fst: %d",
+                sum(pi_cup$in_candidate), sum(pi_lut$in_candidate),
+                sum(dxy_f$in_candidate),  sum(fst_f$in_candidate)))
+
+# ─── SUMMARY STATISTICS ──────────────────────────────────────────────────────
+
+summarize_stat <- function(df, stat_col) {
+  df |>
+    filter(!is.na(.data[[stat_col]])) |>
+    group_by(in_candidate) |>
+    summarize(
+      region    = if_else(first(in_candidate), "Candidate", "Background"),
+      n_windows = n(),
+      mean      = mean(.data[[stat_col]]),
+      median    = median(.data[[stat_col]]),
+      sd        = sd(.data[[stat_col]]),
+      se        = sd / sqrt(n_windows),
+      ci95_lo   = mean - 1.96 * se,
+      ci95_hi   = mean + 1.96 * se,
+      .groups   = "drop"
+    )
+}
+
+summary_all <- bind_rows(
+  summarize_stat(fst_f,  "avg_wc_fst") |> mutate(stat = "Fst"),
+  summarize_stat(dxy_f,  "avg_dxy")    |> mutate(stat = "Dxy"),
+  summarize_stat(pi_cup, "avg_pi")     |> mutate(stat = "Pi_cupreus"),
+  summarize_stat(pi_lut, "avg_pi")     |> mutate(stat = "Pi_luteus")
+)
+
+message("\n=== Summary statistics ===")
+print(summary_all |> select(stat, region, n_windows, mean, median, sd, ci95_lo, ci95_hi), n = Inf)
+write_tsv(summary_all, file.path(OUTDIR, "summary_stats.tsv"))
+
+# ─── PER-CANDIDATE BREAKDOWN ──────────────────────────────────────────────────
+
+per_region <- function(df, stat_col) {
+  df |>
+    filter(in_candidate, !is.na(.data[[stat_col]])) |>
+    group_by(candidate_region) |>
+    summarize(n_windows = n(), mean = mean(.data[[stat_col]]),
+              median = median(.data[[stat_col]]), .groups = "drop") |>
+    arrange(desc(mean))
+}
+
+message("\n=== Per-region Fst ==="); print(per_region(fst_f, "avg_wc_fst"))
+message("\n=== Per-region Dxy ==="); print(per_region(dxy_f, "avg_dxy"))
+
+# ─── STATISTICAL TESTS ───────────────────────────────────────────────────────
+
+# 1. Wilcoxon rank-sum test (non-parametric; p-values approximate due to
+#    spatial autocorrelation between windows — use permutation for reporting)
+
+message("\n=== Wilcoxon rank-sum tests (approximate) ===")
+
+run_wilcox <- function(df, stat_col, label) {
+  cand <- df[[stat_col]][df$in_candidate  & !is.na(df[[stat_col]])]
+  bg   <- df[[stat_col]][!df$in_candidate & !is.na(df[[stat_col]])]
+  if (length(cand) < 2) { cat(sprintf("  %-18s SKIPPED (too few candidate windows)\n", label)); return() }
+  w <- wilcox.test(cand, bg, alternative = "two.sided")
+  cat(sprintf("  %-18s W=%.0f  p=%.5f  cand_mean=%.5f  bg_mean=%.5f  n_cand=%d\n",
+              label, w$statistic, w$p.value, mean(cand), mean(bg), length(cand)))
+}
+
+run_wilcox(fst_f,  "avg_wc_fst", "Fst")
+run_wilcox(dxy_f,  "avg_dxy",    "Dxy")
+run_wilcox(pi_cup, "avg_pi",     "Pi (cupreus)")
+run_wilcox(pi_lut, "avg_pi",     "Pi (luteus)")
+
+# 2. Permutation test — RECOMMENDED for reporting
+#
+# Null: candidate windows are no different from a random draw of the same
+# number of windows from the genome background.
+# Avoids the inflated-N problem from spatial autocorrelation by comparing
+# means rather than testing window-level independence.
+#
+# Reports: observed difference in means, p_perm (two-tailed), fold enrichment
+
+perm_test <- function(df, stat_col, n_perm = 10000, seed = 42) {
+  set.seed(seed)
+  cand_vals <- df[[stat_col]][df$in_candidate  & !is.na(df[[stat_col]])]
+  bg_vals   <- df[[stat_col]][!df$in_candidate & !is.na(df[[stat_col]])]
+  if (length(cand_vals) < 2 || length(bg_vals) < length(cand_vals)) {
+    return(tibble(obs_cand_mean=NA, obs_bg_mean=NA, obs_diff=NA,
+                  fold_over_bg=NA, p_perm=NA, n_cand=length(cand_vals), n_bg=length(bg_vals)))
+  }
+  obs_diff  <- mean(cand_vals) - mean(bg_vals)
+  perm_diffs <- replicate(n_perm,
+                          mean(sample(bg_vals, length(cand_vals), replace = FALSE)) - mean(bg_vals))
+  tibble(
+    obs_cand_mean = mean(cand_vals),
+    obs_bg_mean   = mean(bg_vals),
+    obs_diff      = obs_diff,
+    fold_over_bg  = mean(cand_vals) / mean(bg_vals),
+    p_perm        = mean(abs(perm_diffs) >= abs(obs_diff)),
+    n_cand        = length(cand_vals),
+    n_bg          = length(bg_vals)
+  )
+}
+
+message("\n=== Permutation tests (n=10,000 draws from background; two-tailed) ===")
+
+perm_all <- bind_rows(
+  perm_test(fst_f,  "avg_wc_fst") |> mutate(stat = "Fst"),
+  perm_test(dxy_f,  "avg_dxy")    |> mutate(stat = "Dxy"),
+  perm_test(pi_cup, "avg_pi")     |> mutate(stat = "Pi_cupreus"),
+  perm_test(pi_lut, "avg_pi")     |> mutate(stat = "Pi_luteus")
+)
+
+print(perm_all |> select(stat, obs_cand_mean, obs_bg_mean, obs_diff, fold_over_bg, p_perm, n_cand, n_bg), n = Inf)
+write_tsv(perm_all, file.path(OUTDIR, "permutation_test_results.tsv"))
+
+# ─── VISUALIZATION ───────────────────────────────────────────────────────────
+
+COLORS <- c("Candidate" = "#C0392B", "Background" = "#7F8C8D")
+
+# Violin + boxplot
+violin_compare <- function(df, stat_col, title, y_label) {
+  df |>
+    filter(!is.na(.data[[stat_col]])) |>
+    mutate(Region = if_else(in_candidate, "Candidate", "Background")) |>
+    ggplot(aes(x = Region, y = .data[[stat_col]], fill = Region)) +
+    geom_violin(alpha = 0.55, trim = FALSE, scale = "width") +
+    geom_boxplot(width = 0.13, fill = "white", outlier.size = 0.4, alpha = 0.9) +
+    stat_summary(fun = mean, geom = "point", shape = 18, size = 3.5, color = "black") +
+    scale_fill_manual(values = COLORS) +
+    labs(title = title, y = y_label, x = NULL) +
+    theme_bw(base_size = 11) +
+    theme(legend.position = "none",
+          plot.title = element_text(face = "bold", size = 11))
+}
+
+violin_grid <- (
+  violin_compare(fst_f,  "avg_wc_fst", "Fst",             "Fst (WC84)")  |
+    violin_compare(dxy_f,  "avg_dxy",    "Dxy",             "Dxy")
+) / (
+  violin_compare(pi_cup, "avg_pi",     "Pi (M. cupreus)", "Pi") |
+    violin_compare(pi_lut, "avg_pi",     "Pi (M. luteus)",  "Pi")
+) +
+  plot_annotation(
+    title    = "Divergence statistics: candidate vs. genome background",
+    subtitle = sprintf("%d bp windows | %s vs. %s | Diamond = mean", WINDOW_SIZE, POP1, POP2),
+    theme    = theme(plot.title = element_text(face = "bold"))
+  )
+
+ggsave(file.path(OUTDIR, "candidate_vs_genome_violins.pdf"), violin_grid, width = 9, height = 7)
+
+# Manhattan-style plot
+manhattan_plot <- function(df, stat_col, y_label, plot_title, raw_df) {
+  # Use raw (unfiltered) data for chromosome boundaries
+  chrom_info <- raw_df |>
+    group_by(chromosome) |>
+    summarize(chrom_len = max(window_pos_2), .groups = "drop") |>
+    arrange(chromosome) |>
+    mutate(offset    = cumsum(lag(chrom_len, default = 0)),
+           chrom_mid = offset + chrom_len / 2,
+           chrom_idx = row_number())
+  
+  df_plot <- df |>
+    filter(!is.na(.data[[stat_col]])) |>
+    left_join(chrom_info |> select(chromosome, offset, chrom_idx), by = "chromosome") |>
+    mutate(plot_x = (window_pos_1 + window_pos_2) / 2 + offset)
+  
+  strips <- chrom_info |>
+    mutate(xmin = offset, xmax = offset + chrom_len,
+           fill_col = if_else(chrom_idx %% 2 == 0, "white", "grey96"))
+  
+  ggplot(df_plot, aes(x = plot_x, y = .data[[stat_col]])) +
+    geom_rect(data = strips,
+              aes(xmin = xmin, xmax = xmax, ymin = -Inf, ymax = Inf, fill = fill_col),
+              inherit.aes = FALSE, alpha = 0.6) +
+    scale_fill_identity() +
+    geom_point(aes(color = in_candidate), size = 0.35, alpha = 0.55) +
+    scale_color_manual(values = c("FALSE" = "grey55", "TRUE" = "#C0392B"),
+                       labels = c("FALSE" = "Background", "TRUE" = "Candidate"),
+                       name = NULL) +
+    scale_x_continuous(breaks = chrom_info$chrom_mid, labels = chrom_info$chromosome,
+                       expand = expansion(mult = 0.01)) +
+    labs(y = y_label, x = NULL, title = plot_title) +
+    theme_bw(base_size = 10) +
+    theme(axis.text.x = element_text(angle = 55, hjust = 1, size = 7),
+          legend.position = "top",
+          panel.grid.minor = element_blank(),
+          panel.grid.major.x = element_blank())
+}
+
+
+ggsave("manhattan_dxy.pdf",
+       manhattan_plot(dxy_f, "avg_dxy", "Dxy", "Genome-wide Dxy", raw_df = dxy),
+       width = 14, height = 4)
+
+ggsave("manhattan_fst.pdf",
+       manhattan_plot(fst_f, "avg_wc_fst", "Fst (WC84)", "Genome-wide Fst", raw_df = fst),
+       width = 14, height = 4)
+
+message("\nDone. Output in: ", OUTDIR)
+message("  summary_stats.tsv | permutation_test_results.tsv")
+message("  candidate_vs_genome_violins.pdf | manhattan_fst.pdf | manhattan_dxy.pdf")
+
+
+# =============================================================================
+# Genome-wide population statistics from pixy output -- by region
+# ---------------------------------------------------------------------------
+# Expects this layout, with the script sitting alongside wganalysis/:
+#
+#   ./
+#   |-- pixy_popstats_by_region.R      <- this script
+#   |-- wganalysis/
+#       |-- north_pixy/    pixy_pi.txt  pixy_dxy.txt  pixy_fst.txt
+#       |-- central_pixy/  pixy_pi.txt  pixy_dxy.txt  pixy_fst.txt
+#       |-- south_pixy/    pixy_pi.txt  pixy_dxy.txt  pixy_fst.txt
+#
+# Each folder holds a cupreus (C) vs luteus (L) comparison for that region.
+# Everything is stacked into one long table with a `region` column, so the
+# headline contrast (north vs south C-vs-L divergence) falls straight out.
+# =============================================================================
+
+library(tidyverse)
+
+# --- SETTINGS ----------------------------------------------------------------
+
+BASE_DIR <- "wganalysis"          # folder holding the *_pixy subfolders
+
+# Region folder -> display label. Order here sets the order in every figure.
+REGIONS <- c(north_pixy   = "North",
+             central_pixy = "Central",
+             south_pixy   = "South")
+
+# Map the pixy `pop` labels to display names. Left side must match your
+# pixy populations file exactly.
+POP_LABELS <- c(C = "cupreus", L = "luteus")
+
+WINDOW_SIZE <- 5000               # window size used in the pixy run (labels only)
+
+MIN_SITES <- 500                  # min callable sites for a Pi / Dxy window
+MIN_SNPS  <- 5                    # min SNPs for an Fst window
+
+N_BOOT <- 1000                    # bootstrap replicates for CIs
+
+OUTDIR <- "pop_stats_summary"
+dir.create(OUTDIR, showWarnings = FALSE)
+set.seed(42)
+
+
+# --- LOAD ALL REGIONS --------------------------------------------------------
+# read_region() reads one pixy file from one region folder and tags it.
+
+read_region <- function(folder, label, filename) {
+  path <- file.path(BASE_DIR, folder, filename)
+  if (!file.exists(path)) {
+    stop("Missing file: ", path,
+         "\nCheck BASE_DIR and the REGIONS folder names at the top of the script.")
+  }
+  read_tsv(path, show_col_types = FALSE) |>
+    mutate(region = label, .before = 1)
+}
+
+read_all <- function(filename) {
+  imap(REGIONS, ~ read_region(.y, .x, filename)) |>
+    list_rbind() |>
+    mutate(region = factor(region, levels = unname(REGIONS)))
+}
+
+# NB: named *_raw so we don't mask R's built-in `pi` constant.
+pi_raw  <- read_all("pixy_pi.txt")
+dxy_raw <- read_all("pixy_dxy.txt")
+fst_raw <- read_all("pixy_fst.txt")
+
+message("Loaded windows per region:")
+print(count(pi_raw, region, pop))
+
+# Guard: the count columns are what correct Pi/Dxy aggregation depends on
+if (!all(c("count_diffs", "count_comparisons") %in% names(pi_raw))) {
+  stop("count_diffs / count_comparisons not found in pixy_pi.txt. ",
+       "Genome-wide Pi/Dxy cannot be computed correctly without them.")
+}
+
+
+# --- BOOTSTRAP HELPERS (resample windows with replacement) -------------------
+
+boot_ratio <- function(diffs, comps, n = N_BOOT) {
+  k <- length(diffs)
+  reps <- replicate(n, {
+    i <- sample.int(k, k, replace = TRUE)
+    sum(diffs[i]) / sum(comps[i])
+  })
+  quantile(reps, c(0.025, 0.975), na.rm = TRUE)
+}
+
+boot_wmean <- function(x, w, n = N_BOOT) {
+  k <- length(x)
+  reps <- replicate(n, {
+    i <- sample.int(k, k, replace = TRUE)
+    weighted.mean(x[i], w[i], na.rm = TRUE)
+  })
+  quantile(reps, c(0.025, 0.975), na.rm = TRUE)
+}
+
+
+# --- PI: per species, per region ---------------------------------------------
+# Genome-wide Pi is sum(count_diffs)/sum(count_comparisons), NOT mean(avg_pi).
+# Averaging per-window ratios overweights sparse windows and biases the value.
+
+pi_f <- pi_raw |> filter(no_sites >= MIN_SITES)
+
+pi_summary <- pi_f |>
+  group_by(region, pop) |>
+  summarize(
+    n_windows      = n(),
+    total_diffs    = sum(count_diffs,       na.rm = TRUE),
+    total_comps    = sum(count_comparisons, na.rm = TRUE),
+    pi             = total_diffs / total_comps,
+    pi_window_mean = mean(avg_pi, na.rm = TRUE),   # for comparison only
+    .groups = "drop"
+  )
+
+pi_ci <- pi_f |>
+  group_by(region, pop) |>
+  group_modify(~ {
+    ci <- boot_ratio(.x$count_diffs, .x$count_comparisons)
+    tibble(ci95_lo = ci[[1]], ci95_hi = ci[[2]])
+  }) |>
+  ungroup()
+
+pi_summary <- left_join(pi_summary, pi_ci, by = c("region", "pop")) |>
+  mutate(species = recode(pop, !!!POP_LABELS))
+
+
+# --- DXY: C vs L, per region -------------------------------------------------
+
+dxy_f <- dxy_raw |> filter(no_sites >= MIN_SITES)
+
+dxy_summary <- dxy_f |>
+  group_by(region, pop1, pop2) |>
+  summarize(
+    n_windows       = n(),
+    total_diffs     = sum(count_diffs,       na.rm = TRUE),
+    total_comps     = sum(count_comparisons, na.rm = TRUE),
+    dxy             = total_diffs / total_comps,
+    dxy_window_mean = mean(avg_dxy, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+dxy_ci <- dxy_f |>
+  group_by(region, pop1, pop2) |>
+  group_modify(~ {
+    ci <- boot_ratio(.x$count_diffs, .x$count_comparisons)
+    tibble(ci95_lo = ci[[1]], ci95_hi = ci[[2]])
+  }) |>
+  ungroup()
+
+dxy_summary <- left_join(dxy_summary, dxy_ci, by = c("region", "pop1", "pop2"))
+
+
+# --- FST: C vs L, per region -------------------------------------------------
+# Fst is a ratio of variance components, so it can't be aggregated by summing
+# counts the way Pi/Dxy can. With standard pixy output the most defensible
+# summary is a SNP-weighted mean; plain mean and median are reported alongside.
+# Negative per-window WC Fst is normal at low differentiation -- not clamped.
+
+fst_f <- fst_raw |> filter(!is.na(avg_wc_fst), no_snps >= MIN_SNPS)
+
+fst_summary <- fst_f |>
+  group_by(region, pop1, pop2) |>
+  summarize(
+    n_windows    = n(),
+    total_snps   = sum(no_snps, na.rm = TRUE),
+    fst_weighted = weighted.mean(avg_wc_fst, w = no_snps, na.rm = TRUE),
+    fst_mean     = mean(avg_wc_fst,   na.rm = TRUE),
+    fst_median   = median(avg_wc_fst, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+fst_ci <- fst_f |>
+  group_by(region, pop1, pop2) |>
+  group_modify(~ {
+    ci <- boot_wmean(.x$avg_wc_fst, .x$no_snps)
+    tibble(ci95_lo = ci[[1]], ci95_hi = ci[[2]])
+  }) |>
+  ungroup()
+
+fst_summary <- left_join(fst_summary, fst_ci, by = c("region", "pop1", "pop2"))
+
+
+# --- PRINT + WRITE TABLES ----------------------------------------------------
+
+message("\n=== Pi (per species, per region) ===")
+print(pi_summary |> select(region, species, n_windows, pi, ci95_lo, ci95_hi,
+                           pi_window_mean), n = Inf)
+
+message("\n=== Dxy (cupreus vs luteus, per region) ===")
+print(dxy_summary |> select(region, n_windows, dxy, ci95_lo, ci95_hi,
+                            dxy_window_mean), n = Inf)
+
+message("\n=== Fst (cupreus vs luteus, per region) ===")
+print(fst_summary |> select(region, n_windows, fst_weighted, ci95_lo, ci95_hi,
+                            fst_mean, fst_median), n = Inf)
+
+write_tsv(pi_summary,  file.path(OUTDIR, "pi_summary_by_region.tsv"))
+write_tsv(dxy_summary, file.path(OUTDIR, "dxy_summary_by_region.tsv"))
+write_tsv(fst_summary, file.path(OUTDIR, "fst_summary_by_region.tsv"))
+
+# One tidy table ready to drop into the manuscript
+manuscript_table <- bind_rows(
+  pi_summary |> transmute(region, statistic = paste0("Pi (", species, ")"),
+                          estimate = pi, ci95_lo, ci95_hi, n_windows),
+  dxy_summary |> transmute(region, statistic = "Dxy (C vs L)",
+                           estimate = dxy, ci95_lo, ci95_hi, n_windows),
+  fst_summary |> transmute(region, statistic = "Fst (C vs L)",
+                           estimate = fst_weighted, ci95_lo, ci95_hi, n_windows)
+) |>
+  arrange(region, statistic) |>
+  mutate(across(c(estimate, ci95_lo, ci95_hi), ~ signif(.x, 3)))
+
+message("\n=== Manuscript table ===")
+print(manuscript_table, n = Inf)
+write_tsv(manuscript_table, file.path(OUTDIR, "manuscript_table.tsv"))
+
+
+# --- PLOT 1: the headline figure -- Dxy and Fst by region --------------------
+
+pair_stats <- bind_rows(
+  dxy_summary |> transmute(region, statistic = "D[XY]",
+                           estimate = dxy, ci95_lo, ci95_hi),
+  fst_summary |> transmute(region, statistic = "F[ST]",
+                           estimate = fst_weighted, ci95_lo, ci95_hi)
+)
+
+p_pairs <- ggplot(pair_stats, aes(x = region, y = estimate)) +
+  geom_pointrange(aes(ymin = ci95_lo, ymax = ci95_hi),
+                  linewidth = 0.7, size = 0.6, colour = "grey15") +
+  facet_wrap(~ statistic, scales = "free_y", labeller = label_parsed) +
+  labs(x = NULL, y = "Estimate (95% CI)",
+       title = "Cupreus vs luteus divergence by region") +
+  theme_bw(base_size = 12) +
+  theme(panel.grid.minor = element_blank(),
+        strip.background = element_rect(fill = "grey95", colour = NA))
+
+ggsave(file.path(OUTDIR, "divergence_by_region.pdf"), p_pairs,
+       width = 7, height = 3.5)
+
+
+# --- PLOT 2: per-window Fst distributions by region --------------------------
+# Shows the spread behind each mean -- makes the north/south contrast concrete.
+
+p_fst_dist <- ggplot(fst_f, aes(x = region, y = avg_wc_fst)) +
+  geom_violin(fill = "grey85", colour = NA, scale = "width") +
+  geom_boxplot(width = 0.12, outlier.size = 0.2, outlier.alpha = 0.3,
+               fill = "white") +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "grey50",
+             linewidth = 0.3) +
+  labs(x = NULL,
+       y = bquote(F[ST]~"(per "*.(WINDOW_SIZE/1000)*" kb window)"),
+       title = "Per-window cupreus vs luteus Fst by region") +
+  theme_bw(base_size = 12) +
+  theme(panel.grid.minor = element_blank())
+
+ggsave(file.path(OUTDIR, "fst_windows_by_region.pdf"), p_fst_dist,
+       width = 6, height = 4)
+
+
+# --- PLOT 3: Pi per species, per region --------------------------------------
+
+p_pi <- ggplot(pi_summary, aes(x = region, y = pi, fill = species)) +
+  geom_col(position = position_dodge(width = 0.7), width = 0.6,
+           colour = "grey30", linewidth = 0.2) +
+  geom_errorbar(aes(ymin = ci95_lo, ymax = ci95_hi),
+                position = position_dodge(width = 0.7), width = 0.15) +
+  scale_fill_manual(values = c(cupreus = "grey35", luteus = "grey75")) +
+  labs(x = NULL, y = expression(pi), fill = NULL,
+       title = "Nucleotide diversity by species and region") +
+  theme_bw(base_size = 12) +
+  theme(panel.grid.minor = element_blank(),
+        legend.position = "top")
+
+ggsave(file.path(OUTDIR, "pi_by_species_region.pdf"), p_pi,
+       width = 6, height = 4)
+
+message("\nDone. Tables + figures written to: ", normalizePath(OUTDIR))
