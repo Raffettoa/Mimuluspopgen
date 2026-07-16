@@ -67,6 +67,19 @@ Q30_run_20k <- conStruct(spatial = FALSE,
                           n.iter=20000,
                           prefix = "Q30_run_20k")
 
+#find optimal number of clusters
+x.validation(
+  train.prop = 0.9,
+  prefix = "val",
+  K = 1:4,
+  freqs = freq,
+  geoDist = dist,
+  coords = geo,
+  n.iter = 80000,
+  n.reps = 1,
+  make.figs = FALSE
+)
+
 
 #saveRDS(STR_k2_i1000_delta95, file = "STR_k2_i1000_delta95.RDS")
 #how to reload
