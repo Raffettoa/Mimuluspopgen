@@ -1,0 +1,195 @@
+#Phenotype PCA
+
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from sklearn.decomposition import PCA
+from sklearn.preprocessing import StandardScaler
+
+mimulus = pd.read_csv("output.csv")
+
+# Map population prefix to region
+def assign_region(id_val):
+    if id_val.startswith("LM"):
+        return "Central"
+    elif id_val.startswith("LC") or id_val.startswith("LQ") or id_val.startswith("TF"):
+        return "North"
+    elif id_val.startswith("TC") or id_val.startswith("LL"):
+        return "South"
+    else:
+        return "Unknown"
+
+mimulus["Region"] = mimulus["ID"].apply(assign_region)
+
+# Average replicates per individual
+feature_cols = ["upp_stamen_len", "low_stamen_len", "style_len", "upper_calyx_len", "lower_calyx_len", "flower_len", "flower_wid", "peduncle_len"]  # add all your trait columns here
+mimulus_avg = mimulus.groupby(["ID", "species", "Region"])[feature_cols].mean().reset_index()
+
+# Standardize features
+scaler = StandardScaler()
+X = scaler.fit_transform(mimulus_avg[feature_cols])
+
+# Run PCA
+pca = PCA()
+X_pca = pca.fit_transform(X)
+
+# Variance explained
+pc1_var = round(pca.explained_variance_ratio_[0] * 100, 2)
+pc2_var = round(pca.explained_variance_ratio_[1] * 100, 2)
+
+# Plot
+colors = {"cupreus": "#003366", "luteus": "#E63946"}
+
+fig, ax = plt.subplots(figsize=(8, 6))
+for species, group in mimulus_avg.groupby("species"):
+    idx = mimulus_avg[mimulus_avg["species"] == species].index
+    ax.scatter(X_pca[idx, 0], X_pca[idx, 1],
+               label=species, color=colors[species], s=60)
+
+ax.set_xlabel(f"PC1 ({pc1_var}%)")
+ax.set_ylabel(f"PC2 ({pc2_var}%)")
+ax.legend(title="Species")
+ax.set_title("PCA of Mimulus floral traits")
+plt.tight_layout()
+plt.show()
+
+
+# Split by region
+north = mimulus_avg[mimulus_avg["Region"].isin(["North", "Central"])].copy()
+south = mimulus_avg[mimulus_avg["Region"] == "South"].copy()
+
+colors = {"cupreus": "#003366", "luteus": "#E63946"}
+
+fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+
+for ax, subset, title in zip(axes, [north, south], ["North", "South"]):
+    # Standardize and run PCA separately for each region
+    X = scaler.fit_transform(subset[feature_cols])
+    pca = PCA()
+    X_pca = pca.fit_transform(X)
+    
+    pc1_var = round(pca.explained_variance_ratio_[0] * 100, 2)
+    pc2_var = round(pca.explained_variance_ratio_[1] * 100, 2)
+    
+    for species, group in subset.groupby("species"):
+        idx = subset.reset_index(drop=True)
+        idx = idx[idx["species"] == species].index
+        ax.scatter(X_pca[idx, 0], X_pca[idx, 1],
+                   label=species, color=colors[species], s=60)
+    
+    ax.set_xlabel(f"PC1 ({pc1_var}%)")
+    ax.set_ylabel(f"PC2 ({pc2_var}%)")
+    ax.set_title(f"{title} populations")
+    ax.legend(title="Species")
+
+plt.suptitle("PCA of Mimulus floral traits by region", fontsize=14)
+plt.tight_layout()
+plt.show()
+
+#Phenotype boxplots--------------------------------------------------------------------------------------------------------------------------
+import pandas as pd
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+import numpy as np
+from scipy import stats
+
+# ── Load your data ──────────────────────────────────────────────────────────
+df = pd.read_csv('output.csv') 
+
+# ── Settings ─────────────────────────────────────────────────────────────────
+traits = ['upp_stamen_len', 'low_stamen_len', 'style_len',
+          'upper_calyx_len', 'lower_calyx_len', 'flower_len',
+          'flower_wid', 'peduncle_len']
+
+labels = {
+    'upp_stamen_len':   'Upper stamen length (mm)',
+    'low_stamen_len':   'Lower stamen length (mm)',
+    'style_len':        'Style length (mm)',
+    'upper_calyx_len':  'Upper calyx length (mm)',
+    'lower_calyx_len':  'Lower calyx length (mm)',
+    'flower_len':       'Flower length (mm)',
+    'flower_wid':       'Flower width (mm)',
+    'peduncle_len':     'Peduncle length (mm)',
+}
+
+species_order = ['cupreus', 'luteus']
+colors = {"cupreus": "#003366", "luteus": "#E63946"}
+
+def format_pval(p):
+    if p < 0.001:   return 'p < 0.001 ***'
+    elif p < 0.01:  return f'p = {p:.3f} **'
+    elif p < 0.05:  return f'p = {p:.3f} *'
+    else:           return f'p = {p:.3f} ns'
+
+rng = np.random.default_rng(0)
+
+# ── Plot ──────────────────────────────────────────────────────────────────────
+fig, axes = plt.subplots(2, 4, figsize=(14, 7))
+axes = axes.flatten()
+
+for ax, trait in zip(axes, traits):
+    groups = [df.loc[df['species'] == sp, trait].dropna().values
+              for sp in species_order]
+
+    # Boxplot
+    bp = ax.boxplot(
+        groups,
+        positions=[1, 2],
+        widths=0.3,
+        patch_artist=True,
+        medianprops=dict(color='black', linewidth=2),
+        whiskerprops=dict(linewidth=1.2),
+        capprops=dict(linewidth=1.2),
+        flierprops=dict(marker=''),
+    )
+    for patch, sp in zip(bp['boxes'], species_order):
+        patch.set_facecolor('none')
+        patch.set_edgecolor(colors[sp])
+        patch.set_linewidth(2)
+    for whisker, color in zip(bp['whiskers'],
+                               [colors['cupreus'], colors['cupreus'],
+                                colors['luteus'],  colors['luteus']]):
+        whisker.set_color(color)
+    for cap, color in zip(bp['caps'],
+                           [colors['cupreus'], colors['cupreus'],
+                            colors['luteus'],  colors['luteus']]):
+        cap.set_color(color)
+
+    # Jittered points
+    for xi, (sp, vals) in enumerate(zip(species_order, groups), start=1):
+        jitter = rng.uniform(-0.1, 0.1, size=len(vals))
+        ax.scatter(xi + jitter, vals,
+                   color=colors[sp], alpha=0.3, s=18, zorder=3)
+
+    # Welch's t-test + bracket
+    _, p_val = stats.ttest_ind(groups[0], groups[1], equal_var=False)
+    y_max  = max(np.concatenate(groups)) * 1.05
+    y_line = y_max * 1.03
+    ax.plot([1, 1, 2, 2], [y_max, y_line, y_line, y_max],
+            lw=1.2, color='black')
+    ax.text(1.5, y_line * 1.005, format_pval(p_val),
+            ha='center', va='bottom', fontsize=7.5)
+
+    # Labels and formatting  ← these 7 lines are INSIDE the loop
+    ax.set_xticks([1, 2])
+    ax.set_xticklabels(['cupreus', 'luteus'], fontsize=9)
+    for tick in ax.get_xticklabels():
+        tick.set_fontstyle('italic')
+    ax.set_ylabel(labels[trait], fontsize=8.5)
+    ax.set_xlabel('', fontsize=9)
+    ax.spines[['top', 'right']].set_visible(False)
+    ax.set_xlim(0.5, 2.5)
+
+# ── Everything below is OUTSIDE the loop ─────────────────────────────────────
+handles = [mpatches.Patch(facecolor='none', edgecolor=colors[sp],
+                           linewidth=2, label=f'M. {sp}')
+           for sp in species_order]
+fig.legend(handles=handles, loc='lower center', ncol=2,
+           frameon=False, fontsize=9, bbox_to_anchor=(0.5, -0.01),
+           prop={'style': 'italic', 'size': 9})
+
+fig.suptitle('Floral trait comparison',
+             fontsize=12, y=1.01)
+plt.tight_layout(rect=[0, 0.04, 1, 0.97])
+plt.savefig('boxplots_pheno.pdf', format='pdf', bbox_inches='tight')
+plt.show()
