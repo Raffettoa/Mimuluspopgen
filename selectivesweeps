@@ -1,0 +1,282 @@
+#10 SWEEPFINDER2 prep. This extracts the necessary data from the VCF so it may be read by SF2 (Need to start with the appropriate filtered vcf… but without removing MAF etc but yes to missing data. May be created using customfilters.sh This is FOLDED, VARIANT, LESS INDIVIDUALS THAN 60-------------------------------
+
+#!/bin/tcsh
+#SBATCH --job-name=vcf_to_sf2
+#SBATCH -N 1
+#SBATCH --ntasks-per-node 1
+#SBATCH -t 4:00:00
+#SBATCH --mem=32G
+
+module load miniforge3/24.9.2-0
+conda activate mimulus
+
+set VCF = "north_filter_SF2.recode.vcf.gz"
+
+echo "Step 1: Recalculating AC and AN fields..."
+set TEMP_VCF = "temp_recalc_$$.vcf.gz"
+bcftools +fill-tags $VCF -O z -o $TEMP_VCF -- -t AC,AN,AF
+bcftools index $TEMP_VCF
+echo "AC/AN recalculated for actual samples in VCF"
+echo ""
+
+mkdir -p sf2_input_files
+cd sf2_input_files
+
+echo "Starting VCF to SweepFinder2 conversion..."
+echo ""
+
+echo "Extracting chromosome lists..."
+bcftools query -f '%CHROM\n' ../$TEMP_VCF | sort -u | grep 'A$' > A_chroms.txt
+bcftools query -f '%CHROM\n' ../$TEMP_VCF | sort -u | grep 'B$' > B_chroms.txt
+
+echo "Found `wc -l < A_chroms.txt` A chromosomes"
+echo "Found `wc -l < B_chroms.txt` B chromosomes"
+echo ""
+
+echo "Processing A subgenome chromosomes..."
+foreach chrom (`cat A_chroms.txt`)
+    echo "  Converting $chrom (folding SFS to MAF)..."
+    bcftools query -f '%POS\t%AC\t%AN\n' -r $chrom ../$TEMP_VCF > temp_$chrom.txt
+    
+    # Fold and filter in one awk command - all on one line for tcsh
+    awk 'BEGIN{OFS="\t"} {if ($2 > $3/2) x = $3-$2; else x = $2; if (x > 0) print $1, x, $3}' temp_$chrom.txt > temp_folded_$chrom.txt
+    
+    # Add header
+    echo "position\tx\tn" > $chrom\_sf2.txt
+    cat temp_folded_$chrom.txt >> $chrom\_sf2.txt
+    
+    rm temp_$chrom.txt temp_folded_$chrom.txt
+    
+    set variant_count = `wc -l < $chrom\_sf2.txt`
+    @ variant_count = $variant_count - 1
+    echo "    Wrote $chrom\_sf2.txt ($variant_count variant sites)"
+end
+
+echo ""
+echo "Processing B subgenome chromosomes..."
+foreach chrom (`cat B_chroms.txt`)
+    echo "  Converting $chrom (folding SFS to MAF)..."
+    bcftools query -f '%POS\t%AC\t%AN\n' -r $chrom ../$TEMP_VCF > temp_$chrom.txt
+    
+    # Fold and filter in one awk command - all on one line for tcsh
+    awk 'BEGIN{OFS="\t"} {if ($2 > $3/2) x = $3-$2; else x = $2; if (x > 0) print $1, x, $3}' temp_$chrom.txt > temp_folded_$chrom.txt
+    
+    # Add header
+    echo "position\tx\tn" > $chrom\_sf2.txt
+    cat temp_folded_$chrom.txt >> $chrom\_sf2.txt
+    
+    rm temp_$chrom.txt temp_folded_$chrom.txt
+    
+    set variant_count = `wc -l < $chrom\_sf2.txt`
+    @ variant_count = $variant_count - 1
+    echo "    Wrote $chrom\_sf2.txt ($variant_count variant sites)"
+end
+
+echo ""
+echo "Cleaning up temporary VCF..."
+cd ..
+rm $TEMP_VCF $TEMP_VCF.csi
+
+echo "Conversion complete (folded SFS, variants only)!"
+
+
+#11 run_sweepfinder2_folded. Run the sweepfinder2 script on the processed new files. Next will be taking it to R to analyze---------------------------------------------------
+#!/bin/tcsh
+#SBATCH --job-name=sweepfinder2_folded
+#SBATCH -N 1
+#SBATCH --ntasks-per-node 1
+#SBATCH -t 24:00:00
+#SBATCH --mem=32G
+
+module load miniforge3/24.9.2-0
+conda activate pixy
+
+# Navigate to the directory with SF2 input files
+cd sf2_input_files
+
+# Step 1: Create genome-wide background SFS for A subgenome
+echo "Step 1: Creating A subgenome background SFS..."
+cat Chr*A_sf2.txt > A_all_sites.txt
+echo "  Combined `wc -l < A_all_sites.txt` total sites for A subgenome"
+SweepFinder2 -f A_all_sites.txt A_background.sf2
+echo "  Created A_background.sf2"
+echo ""
+
+# Step 2: Create genome-wide background SFS for B subgenome
+echo "Step 2: Creating B subgenome background SFS..."
+cat Chr*B_sf2.txt > B_all_sites.txt
+echo "  Combined `wc -l < B_all_sites.txt` total sites for B subgenome"
+SweepFinder2 -f B_all_sites.txt B_background.sf2
+echo "  Created B_background.sf2"
+echo ""
+
+grep -v "^position" A_all_sites.txt > temp_A.txt
+printf "position\tx\tn\n" > A_all_sites.txt
+cat temp_A.txt >> A_all_sites.txt
+rm temp_A.txt
+
+# Fix B_all_sites.txt
+grep -v "^position" B_all_sites.txt > temp_B.txt
+printf "position\tx\tn\n" > B_all_sites.txt
+cat temp_B.txt >> B_all_sites.txt
+rm temp_B.txt
+
+# Verify - should show 1 for each
+grep -c "^position" A_all_sites.txt
+grep -c "^position" B_all_sites.txt
+
+# Regenerate backgrounds
+SweepFinder2 -f A_all_sites.txt A_background.sf2
+SweepFinder2 -f B_all_sites.txt B_background.sf2
+
+# Step 3: Create output directory for sweep scans
+mkdir -p sweeps_output
+echo "Step 3: Running chromosome scans (grid-based, 10kb intervals)..."
+echo ""
+
+# Step 4: Scan A subgenome chromosomes
+echo "Scanning A subgenome chromosomes..."
+foreach file (Chr*A_sf2.txt)
+    if ( -f "$file" ) then
+        set chrom = `basename $file _sf2.txt`
+        echo "  Scanning $chrom..."
+        SweepFinder2 -lg 10000 $file A_background.sf2 sweeps_output/${chrom}_sweeps.out
+        echo "    Output: sweeps_output/${chrom}_sweeps.out"
+    endif
+end
+echo ""
+
+# Step 5: Scan B subgenome chromosomes
+echo "Scanning B subgenome chromosomes..."
+foreach file (Chr*B_sf2.txt)
+    if ( -f "$file" ) then
+        set chrom = `basename $file _sf2.txt`
+        echo "  Scanning $chrom..."
+        SweepFinder2 -lg 10000 $file B_background.sf2 sweeps_output/${chrom}_sweeps.out
+        echo "    Output: sweeps_output/${chrom}_sweeps.out"
+    endif
+end
+echo ""
+
+
+#11 Visualize Sweeps --------------------------------------------------------------------------------------------------------------------------
+sfs <- read.csv("background.csv")
+barplot(sfs$propB, 
+        names.arg = sfs$allelectB,
+        xlab = "Allele Count", 
+        ylab = "Expected Frequency",
+        main = "B Subgenome Neutral SFS",
+        col = "skyblue")
+
+plot(sfs$allelectA, sfs$propA,
+     type = "l", lwd = 2, col = "blue",
+     xlab = "Allele Count", 
+     ylab = "Expected Frequency",
+     main = "Neutral SFS: A vs B subgenomes")
+
+lines(sfs$allelectB, sfs$propB,
+      lwd = 2, col = "orange")
+
+legend("topright", 
+       legend = c("A subgenome", "B subgenome"),
+       col = c("blue", "orange"),
+       lwd = 2)
+
+#Sweepfinder and rearrangements
+
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+
+# Function to read SweepFinder2 output
+read_sf2 <- function(file) {
+  df <- read.table(file, header = TRUE)
+  # Extract chromosome name from filename
+  chrom <- sub("_sweeps.out", "", basename(file))
+  df$chromosome <- chrom
+  return(df)
+}
+
+# Get all sweep output files
+A_files <- list.files(pattern = "Chr.*A_sweeps.out")
+B_files <- list.files(pattern = "Chr.*B_sweeps.out")
+
+# Read all A subgenome results
+A_sweeps <- do.call(rbind, lapply(A_files, read_sf2))
+A_sweeps$subgenome <- "A"
+
+# Read all B subgenome results
+B_sweeps <- do.call(rbind, lapply(B_files, read_sf2))
+B_sweeps$subgenome <- "B"
+
+# Combine
+all_sweeps <- rbind(A_sweeps, B_sweeps)
+
+# Extract chromosome number for ordering
+all_sweeps$chrom_num <- as.numeric(gsub("Chr(\\d+)[AB]", "\\1", all_sweeps$chromosome))
+
+# Order by chromosome number
+all_sweeps <- all_sweeps[order(all_sweeps$chrom_num, all_sweeps$location), ]
+
+print(paste("Loaded", nrow(A_sweeps), "A subgenome positions"))
+print(paste("Loaded", nrow(B_sweeps), "B subgenome positions"))
+
+# PLOT 1: Manhattan plot for both subgenomes
+################################################################################
+
+pdf("manhattan_plot_both_subgenomes.pdf", width = 16, height = 8)
+
+ggplot(all_sweeps, aes(x = location/1e6, y = LR, color = subgenome)) +
+  geom_point(alpha = 0.3, size = 0.5) +
+  facet_wrap(~chromosome, ncol = 5, scales = "free_x") +
+  geom_hline(yintercept = 10, linetype = "dashed", color = "gray50", alpha = 0.5) +
+  geom_hline(yintercept = 20, linetype = "dashed", color = "red", alpha = 0.5) +
+  scale_color_manual(values = c("A" = "#E69F00", "B" = "#56B4E9")) +
+  labs(
+    title = "Selective Sweeps: A vs B Subgenomes",
+    subtitle = "Dashed lines: LR=10 (suggestive), LR=20 (strong)",
+    x = "Position (Mb)",
+    y = "Likelihood Ratio (LR)",
+    color = "Subgenome"
+  ) +
+  theme_bw() +
+  theme(
+    strip.text = element_text(size = 8),
+    axis.text.x = element_text(size = 6)
+  )
+
+dev.off()
+print("Created: manhattan_plot_both_subgenomes.pdf")
+
+# PLOT 2: Homeolog comparison (A vs B for same chromosome number)
+################################################################################
+
+# Create paired data for homeologs
+homeolog_pairs <- all_sweeps %>%
+  select(chrom_num, subgenome, location, LR) %>%
+  pivot_wider(
+    names_from = subgenome,
+    values_from = LR,
+    values_fn = list
+  ) %>%
+  unnest(cols = c(A, B), keep_empty = TRUE)
+
+pdf("homeolog_comparison.pdf", width = 14, height = 10)
+
+ggplot(all_sweeps, aes(x = location/1e6, y = LR, color = subgenome)) +
+  geom_line(alpha = 0.7) +
+  facet_wrap(~paste0("Chr", chrom_num), ncol = 4, scales = "free") +
+  geom_hline(yintercept = 10, linetype = "dashed", alpha = 0.3) +
+  geom_hline(yintercept = 20, linetype = "dashed", color = "red", alpha = 0.3) +
+  scale_color_manual(values = c("A" = "#E69F00", "B" = "#56B4E9")) +
+  labs(
+    title = "Homeologous Chromosome Comparison",
+    subtitle = "Orange = A subgenome, Blue = B subgenome",
+    x = "Position (Mb)",
+    y = "Likelihood Ratio (LR)",
+    color = "Subgenome"
+  ) +
+  theme_bw() +
+  theme(strip.text = element_text(size = 9))
+
+dev.off()
