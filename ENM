@@ -1,0 +1,310 @@
+library(kuenm2)
+library(terra)
+library(corrplot)
+
+occ_data<- read.csv("occ_data_noclean.csv")
+
+vars <- rast(list.files("extdata", pattern="\\.tif$", full.names=TRUE))
+
+vars_ll <- project(vars, "EPSG:4326")
+
+occ_vals <- extract(vars_ll, occ_data[, c("x", "y")])
+occ_vals <- na.omit(occ_vals)
+
+# Spearman correlation matrix
+cor_matrix <- cor(occ_vals[, -1],  # drop the ID column extract() adds
+                  method = "spearman", 
+                  use = "complete.obs")
+
+# Visualize
+corrplot(cor_matrix, 
+         method = "color", 
+         type = "lower",
+         tl.cex = 0.7, 
+         number.cex = 0.5,
+         addCoef.col = "black", 
+         order = "hclust")   # clusters correlated vars together visually
+
+# Get the ranked list of correlated pairs
+cor_long <- as.data.frame(as.table(cor_matrix))
+high_cor <- subset(cor_long, abs(Freq) >= 0.7 & Var1 != Var2)
+high_cor[order(-abs(high_cor$Freq)), ]
+
+# Then automated filtering
+filter_correlated <- function(cor_mat, threshold = 0.7) {
+  keep <- c()
+  drop <- c()
+  vars <- colnames(cor_mat)
+  
+  for (v in vars) {
+    if (v %in% drop) next
+    keep <- c(keep, v)
+    correlated <- names(which(abs(cor_mat[v, ]) >= threshold & names(cor_mat[v,]) != v))
+    drop <- c(drop, correlated)
+  }
+  return(keep)
+}
+
+keep_vars <- filter_correlated(cor_matrix, threshold = 0.7)
+keep_vars  # see what survives
+
+layers_filtered <- vars_ll[[keep_vars]]
+
+#more arbitrary method that takes the prev. result, and optionally adds elevation
+keep_vars <- c("bio_1", "bio_2", "bio_3", "bio_4", "bio_12", "bio_15")
+layers_filtered <- vars_ll[[keep_vars]]
+
+#remove 0s from my rasters. 
+layers_masked <- ifel(layers_filtered == 0, NA, layers_filtered)
+
+#cleaning data---------------------------------------------------
+celldup <- remove_cell_duplicates(data = occ_data, x = "x", y = "y",
+                                  raster_layer = vars_ll[["bio_1"]])
+nrow(celldup)
+
+# move records to valid pixels
+moved <- move_2closest_cell(data = celldup, x = "x", y = "y", 
+                            raster_layer = layers_filtered, move_limit_distance = 10)
+#> Moving occurrences to closest pixels...
+
+nrow(celldup)  # basic cleaning and no cell duplicates
+nrow(moved[moved$condition != "Not_moved", ])
+
+
+#prepping for calibration---------------------------------------------
+cupreus_data <- celldup[celldup$species == "Erythranthe cuprea", ]
+luteus_data  <- celldup[celldup$species == "Erythranthe lutea", ]
+
+lut <- prepare_data(algorithm = "maxnet",
+                  occ = luteus_data,
+                  x = "x", y = "y",
+                  raster_variables = layers_masked,
+                  species = "Erythranthe lutea",
+                  categorical_variables = NULL, 
+                  partition_method = "kfolds", 
+                  n_partitions = 4,
+                  n_background = 1000,
+                  features = c("l", "q", "lq"),
+                  r_multiplier = c(1, 2, 3))
+
+cup <- prepare_data(algorithm = "maxnet",
+                  occ = cupreus_data,
+                  x = "x", y = "y",
+                  raster_variables = layers_masked,
+                  species = "Erythranthe lutea",
+                  categorical_variables = NULL, 
+                  partition_method = "kfolds", 
+                  n_partitions = 4,
+                  n_background = 1000,
+                  features = c("l", "q", "lq"),
+                  r_multiplier = c(1, 2, 3))
+
+
+# Prepare histogram data
+calib_hist <- explore_calibration_hist(data = cup, raster_variables = layers_masked,
+                                       include_m = TRUE)
+
+# Plot histograms
+plot_calibration_hist(explore_calibration = calib_hist)
+
+plot(layers_masked[["bio_1"]])
+
+
+
+##Model Calibration-------------------------------------------------------------
+
+lut_calibrate <- calibration(data = lut, 
+                        error_considered = c(10),
+                        omission_rate = 10,
+                        parallel = FALSE,  # Set TRUE to run in parallel
+                        ncores = 1)  # Define number of cores to run in parallel
+
+lut_calibrate$selected_models$ID
+
+cup_calibrate <- calibration(data = cup, 
+                             error_considered = c(10),
+                             omission_rate = 10,
+                             parallel = FALSE,  # Set TRUE to run in parallel
+                             ncores = 1)  # Define number of cores to run in parallel
+
+cup_calibrate$selected_models$ID
+
+
+# Response curves for model of best fit (477 cup and 455 499 502 507 in this case)
+partition_response_curves(calibration_results = lut_calibrate, modelID = 455)
+partition_response_curves(calibration_results = cup_calibrate, modelID = 477)
+
+##Model Fitting and Exploration-------------------------------------------------
+
+# Fit selected models using calibration results
+lfm <- fit_selected(calibration_results = lut_calibrate, 
+                   replicate_method = "kfolds", n_replicates = 4)
+cfm <- fit_selected(calibration_results = cup_calibrate, 
+                    replicate_method = "kfolds", n_replicates = 4)
+
+all_response_curves(lfm, modelID = "Model_1063", show_variability = TRUE)
+all_response_curves(cfm, modelID = "Model_937", show_variability = TRUE)
+
+lfm$Models[[1]]$Full_model$betas 
+cfm$Models[[1]]$Full_model$betas 
+
+bivariate_response(models = lfm, variable1 = "bio_1", variable2 = "bio_12", 
+                   modelID = "Model_499")
+bivariate_response(models = cfm, variable1 = "bio_1", variable2 = "bio_12", 
+                   modelID = "Model_477")
+
+par(mfrow = c(1, 2), mar = c(4, 4, 2.5, 0.5))
+
+# Bivariate response model 1397 
+bivariate_response(models = lfm, variable1 = "bio_4", variable2 = "bio_15", 
+                   modelID = "Model_943", add_bar = FALSE, main = "Model 943")
+
+# Bivariate response model 1360
+bivariate_response(models = cfm, variable1 = "bio_4", variable2 = "bio_15", 
+                   modelID = "Model_937", add_bar = FALSE, main = "Model 937", 
+                   ylab = "")
+
+# Calculate variable importance
+limp <- variable_importance(models = lfm)
+cimp <- variable_importance(models = cfm)
+
+plot_importance(limp)
+plot_importance(cimp)
+
+##Projecting Models for Maps/Graphs---------------------------------------------
+p_lut <- predict_selected(models = lfm, new_variables = layers_masked,
+                             progress_bar = FALSE)
+p_cup <- predict_selected(models = cfm, new_variables = layers_masked,
+                             progress_bar = FALSE)
+
+chile_ext <- ext(-80, -47, -47, -25)
+lut_cropped <- crop(p_lut$General_consensus$mean, chile_ext)
+cup_cropped <- crop(p_cup$General_consensus$mean, chile_ext)
+
+# Plot side by side
+par(mfrow = c(1, 2))
+terra::plot(lut_cropped, main = "Luteus", range = c(0, 1))
+terra::plot(cup_cropped, main = "Cupreus", range = c(0, 1))
+
+
+##Projecting into future or past conditions
+lgm <- rast(list.files("pastproj/chelsa_LGM_v1_2B_r30s", pattern="\\.tif$", full.names=TRUE))
+lgm <- project(lgm, "EPSG:4326")
+lgm <- lgm[[keep_vars]]
+lgm <- ifel(lgm == 0, NA, lgm)
+
+#idfk what this does because im not sure what lgm looks like and if resampling really screws stuff up.
+lgm <- resample(lgm, layers_masked, method = "bilinear")
+lgm <- crop(lgm, layers_masked)
+lgm <- mask(lgm, layers_masked[["bio_1"]])
+
+
+lh <- rast(list.files("pastproj/LH_v1_2_5m", pattern="\\.tif$", full.names=TRUE))
+lh <- project(lh, "EPSG:4326")
+lh <- lh[[keep_vars]]
+lh <- ifel(lh == 0, NA, lh)
+
+#idfk what this does because im not sure what lgm looks like and if resampling really screws stuff up.
+lh <- resample(lh, layers_masked, method = "bilinear")
+lh <- crop(lh, layers_masked)
+lh <- mask(lh, layers_masked[["bio_1"]])
+
+
+p_lut_lgm <- predict_selected(models = lfm,
+                              new_variables = lgm,
+                              progress_bar = FALSE)
+
+p_cup_lgm <- predict_selected(models = cfm,
+                              new_variables = lgm,
+                              progress_bar = FALSE)
+
+# Plot all four together
+chile_ext <- ext(-76, -65, -56, -17)
+par(mfrow = c(2, 2))
+terra::plot(crop(p_lut$General_consensus$mean, chile_ext), 
+            main = "Luteus - Current", range = c(0,1))
+terra::plot(crop(p_cup$General_consensus$mean, chile_ext), 
+            main = "Cupreus - Current", range = c(0,1))
+terra::plot(crop(p_lut_lgm$General_consensus$mean, chile_ext), 
+            main = "Luteus - LGM", range = c(0,1))
+terra::plot(crop(p_cup_lgm$General_consensus$mean, chile_ext), 
+            main = "Cupreus - LGM", range = c(0,1))
+
+
+p_lut_lh <- predict_selected(models = lfm,
+                              new_variables = lh,
+                              progress_bar = FALSE)
+
+p_cup_lh <- predict_selected(models = cfm,
+                              new_variables = lh,
+                              progress_bar = FALSE)
+
+# Plot all four together
+chile_ext <- ext(-76, -65, -56, -17)
+par(mfrow = c(2, 2))
+terra::plot(crop(p_lut$General_consensus$mean, chile_ext), 
+            main = "Luteus - Current", range = c(0,1))
+terra::plot(crop(p_cup$General_consensus$mean, chile_ext), 
+            main = "Cupreus - Current", range = c(0,1))
+terra::plot(crop(p_lut_lh$General_consensus$mean, chile_ext), 
+            main = "Luteus - LGM", range = c(0,1))
+terra::plot(crop(p_cup_lh$General_consensus$mean, chile_ext), 
+            main = "Cupreus - LGM", range = c(0,1))
+
+
+# Apply threshold to get binary maps (1 = suitable, 0 = not suitable)
+threshold <- 0.3  # adjust based on your model's recommended threshold
+
+lut_current_bin <- ifel(p_lut$General_consensus$mean >= threshold, 1, 0)
+cup_current_bin <- ifel(p_cup$General_consensus$mean >= threshold, 1, 0)
+lut_lgm_bin    <- ifel(p_lut_lgm$General_consensus$mean >= threshold, 1, 0)
+cup_lgm_bin    <- ifel(p_cup_lgm$General_consensus$mean >= threshold, 1, 0)
+
+# Count suitable cells and convert to km2
+# At 30 arc-seconds, each cell is approximately 0.86 km2 at 35°S latitude
+# Better to compute it properly from the raster
+cell_areas <- cellSize(lut_current_bin, unit = "km")
+
+# Suitable area per scenario
+lut_current_area <- global(ifel(lut_current_bin == 1, cell_areas, 0), sum, na.rm=TRUE)
+lut_lgm_area     <- global(ifel(lut_lgm_bin == 1, cell_areas, 0), sum, na.rm=TRUE)
+cup_current_area <- global(ifel(cup_current_bin == 1, cell_areas, 0), sum, na.rm=TRUE)
+cup_lgm_area     <- global(ifel(cup_lgm_bin == 1, cell_areas, 0), sum, na.rm=TRUE)
+
+# Percent change
+lut_change <- (lut_current_area - lut_lgm_area) / lut_lgm_area * 100
+cup_change <- (cup_current_area - cup_lgm_area) / cup_lgm_area * 100
+
+cat("Luteus area change since LGM:", round(lut_change$sum, 1), "%\n")
+cat("Cupreus area change since LGM:", round(cup_change$sum, 1), "%\n")
+
+# Cells where both species are suitable
+overlap <- ifel(lut_current_bin == 1 & cup_current_bin == 1, 1, 0)
+lut_only <- ifel(lut_current_bin == 1 & cup_current_bin == 0, 1, 0)
+cup_only <- ifel(lut_current_bin == 0 & cup_current_bin == 1, 1, 0)
+
+overlap_area     <- global(ifel(overlap == 1, cell_areas, 0), sum, na.rm=TRUE)
+lut_only_area    <- global(ifel(lut_only == 1, cell_areas, 0), sum, na.rm=TRUE)
+cup_only_area    <- global(ifel(cup_only == 1, cell_areas, 0), sum, na.rm=TRUE)
+
+# Schoener's D overlap index (0 = no overlap, 1 = identical)
+# This is the proper metric for niche overlap
+union_area <- global(ifel(lut_current_bin == 1 | cup_current_bin == 1, cell_areas, 0), sum, na.rm=TRUE)
+jaccard <- overlap_area / union_area
+cat("Jaccard overlap index:", round(jaccard$sum, 3), "\n")
+
+# Create a categorical change raster for luteus current vs LGM
+# 0 = never suitable, 1 = lost since LGM, 2 = gained since LGM, 3 = stable suitable
+change_lut <- ifel(lut_lgm_bin == 0 & lut_current_bin == 0, 0,  # never suitable
+                   ifel(lut_lgm_bin == 1 & lut_current_bin == 0, 1,  # lost
+                        ifel(lut_lgm_bin == 0 & lut_current_bin == 1, 2,  # gained
+                             3)))                                           # stable
+
+# Plot with meaningful colors
+plot(crop(change_lut, chile_ext),
+     col = c("grey90", "red", "blue", "green4"),
+     main = "E. luteus habitat change since LGM",
+     legend = FALSE)
+legend("bottomleft", 
+       legend = c("Never suitable", "Lost", "Gained", "Stable"),
+       fill = c("grey90", "red", "blue", "green4"))
