@@ -1,1 +1,65 @@
+#!/bin/tcsh
+#SBATCH --job-name=cup_lut_coords
+#SBATCH --nodes=1
+#SBATCH --ntasks=20
+#SBATCH --time=08:00:00
+#SBATCH --output=cup_lut_coords.%j.out
 
+set USE_RAGTAG = 1
+
+set MAIN   = "/sciclone/data10/akraffetto/mimulustest"
+set REF    = "$MAIN/Mcupreus_genome/Mimulus_cupreus_var_MCY43_V1_release/Mimulus_cupreus_var_MCY43_V1_release/Mimulus_cupreus_var_MCY43/sequences/Mimulus_cupreus_var_MCY43.mainGenome.fasta"
+set QUERY  = "$MAIN/Mluteus_genome/scaffolds_FINAL.novo-v2.fasta"
+set PREFIX = "cupreus_vs_luteus"
+set OUTDIR = "$MAIN/mummer"
+mkdir -p $OUTDIR
+
+module load miniforge3/24.9.2-0
+conda activate mummer
+if ($status != 0) then
+    echo "ERROR: conda activate mummer failed -- check module/env name and stop here."
+    exit 1
+endif
+
+# ---- optional: orient/order luteus against cupreus -------------------------
+# --mm2-params "-x asm20": RagTag's default minimap2 preset (asm5) assumes
+# <5% divergence, tuned for same-species strain assemblies. cupreus/luteus is
+# an interspecies comparison with substantially more divergence (your nucmer
+# identities range down to ~85%), so asm5 will fail to place scaffolds that
+# a looser preset would confidently place. asm20 tolerates ~20% divergence.
+if ($USE_RAGTAG == 1) then
+    ragtag.py scaffold $REF $QUERY -o $OUTDIR/luteus_ragtag -t 20 -u \
+        --mm2-params "-x asm20" >& $OUTDIR/ragtag.log
+    set QUERY = "$OUTDIR/luteus_ragtag/ragtag.scaffold.fasta"
+    echo "Using RagTag-oriented luteus: $QUERY"
+endif
+
+# ---- your existing alignment (settings unchanged) --------------------------
+# NOTE: --threads dropped -- installing ragtag into this shared env appears
+# to have resolved a different (likely MUMmer3) nucmer build that doesn't
+# support it. MUMmer3's nucmer is single-pass anyway, so this just means the
+# alignment runs without explicit threading rather than failing outright.
+nucmer \
+    --mum \
+    -c 100 \
+    -l 50 \
+    -p $OUTDIR/$PREFIX \
+    $REF \
+    $QUERY
+if ($status != 0) then
+    echo "ERROR: nucmer failed -- is the mummer env actually active? check PATH."
+    exit 1
+endif
+
+# NOTE: -l 1000 keeps a lot of small noise. prep_synteny.R filters at 10 kb
+# anyway, but bumping this to -l 10000 shrinks the file and speeds plotting.
+delta-filter -r -q -l 1000 $OUTDIR/$PREFIX.delta \
+    > $OUTDIR/$PREFIX.filt.delta
+show-coords -r -c -l -L 1000 -T $OUTDIR/$PREFIX.filt.delta \
+    > $OUTDIR/$PREFIX.coords
+
+# ---- overview dotplot ------------------------------------------------------
+mummerplot --layout --filter -R $REF -Q $QUERY \
+    --png -p $OUTDIR/dotplot_overview $OUTDIR/$PREFIX.filt.delta
+gnuplot $OUTDIR/dotplot_overview.gp
+echo "done -> $OUTDIR/$PREFIX.coords"
