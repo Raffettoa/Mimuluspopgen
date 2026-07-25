@@ -1,0 +1,636 @@
+Start with the reference genome indexed and get the fastq files for the F2 individuals + Parents
+
+Parent alignment script
+#!/usr/bin/env bash
+set -euo pipefail
+NUM_CORES=6
+MAIN="/sciclone/data10/akraffetto/F2_cuplut"
+REF="/sciclone/data10/akraffetto/mimulustest/1_genome_index/Mimulus_cupreus"
+OUT="$MAIN/2-SAM"
+LOG="$MAIN/Log_align_parents.txt"
+TEMPLATE="$MAIN/align_scripts/align_tmp_PE.tcsh"
+
+mkdir -p "$OUT"
+echo "Starting : $(date)" > "$LOG"
+
+for file in $MAIN/parent_fastq/*_R1_001.fastq.gz; do
+    base=${file##*/}
+    R2=${file%_R1_001.fastq.gz}_R2_001.fastq.gz
+    sample_name=$(echo "$base" | cut -d"_" -f1)   # Cy or V
+
+    outfile=$OUT/${sample_name}_parent.sam
+    start_time=$(date +%s)
+
+    cat "$TEMPLATE" \
+    | sed "s,@@NUM_CORES@@,$NUM_CORES,g" \
+    | sed "s,@@REF@@,$REF,g" \
+    | sed "s,@@file@@,$file,g" \
+    | sed "s,@@R2@@,$R2,g" \
+    | sed "s,@@outfile@@,$outfile,g" \
+    | sed "s,@@LOG@@,$LOG,g" \
+    | sed "s,@@sample_name@@,$sample_name,g" \
+    | sed "s,@@start_time@@,$start_time,g" \
+    | sbatch
+done
+echo 'Process complete : ' $(date) >> "$LOG"
+
+Will call on this script below
+#!/bin/tcsh
+#SBATCH --job-name=@@sample_name@@
+#SBATCH -N 1
+#SBATCH --ntasks-per-node 10
+#SBATCH -t 48:00:00
+module load miniforge3/24.9.2-0
+conda activate mimulus
+
+set start_time = `date +%s`
+set file = @@file@@
+set REF = @@REF@@
+set R2 = @@R2@@
+set outfile = @@outfile@@
+set LOG = @@LOG@@
+
+echo 'Current R1 file:\t\t' $file
+echo 'Current R2 file:\t\t' $R2
+echo 'Output will be:\t\t' $outfile
+
+bowtie2 -p @@NUM_CORES@@ \
+    --local --fast-local \
+    -x $REF \
+    -1 "$file" -2 "$R2" \
+    -S "$outfile" \
+    || echo "Something went wrong with file " $file >> $LOG
+
+set end_time = `date +%s`
+@ elapsed_time = $end_time - $start_time
+@ hours = $elapsed_time / 3600
+@ minutes = ( $elapsed_time % 3600 ) / 60
+@ seconds = $elapsed_time % 60
+echo "Script execution time: $hours hours, $minutes minutes, and $seconds seconds."
+echo $file ' : ' `(date)` >> $LOG
+
+
+F2 alignment script
+#!/usr/bin/env bash
+set -euo pipefail
+NUM_CORES=6
+MAIN="/sciclone/data10/akraffetto/F2_cuplut"
+REF="/sciclone/data10/akraffetto/mimulustest/1_genome_index/Mimulus_cupreus"
+OUT="$MAIN/2-SAM"
+LOG="$MAIN/Log_align_F2.txt"
+TEMPLATE="$MAIN/align_scripts/align_tmp_SE.tcsh"
+
+mkdir -p "$OUT"
+echo "Starting : $(date)" > "$LOG"
+
+shopt -s nullglob
+for file in $MAIN/fastq_reads/Plate_*/*/sample_*.fq.gz \
+            $MAIN/fastq_reads/Plate_*/*/sample_*.fq \
+            $MAIN/fastq_reads/Plate_1_aug/Plate_1_fastq_files/sample_*.fq.gz \
+            $MAIN/fastq_reads/Plate_1_aug/Plate_1_fastq_files/sample_*.fq; do
+
+    base=${file##*/}
+    sample_name=${base%%.*}        # e.g. sample_245 from sample_245.fq.gz or sample_245.2.fq.gz
+    
+    # Skip the .2 mate files if any slipped in - shouldn't exist for SE plates but just in case
+    case "$base" in
+        *.2.fq*) continue ;;
+    esac
+
+    outfile=$OUT/${sample_name}.sam
+    start_time=$(date +%s)
+
+    cat "$TEMPLATE" \
+    | sed "s,@@NUM_CORES@@,$NUM_CORES,g" \
+    | sed "s,@@REF@@,$REF,g" \
+    | sed "s,@@file@@,$file,g" \
+    | sed "s,@@outfile@@,$outfile,g" \
+    | sed "s,@@LOG@@,$LOG,g" \
+    | sed "s,@@sample_name@@,$sample_name,g" \
+    | sed "s,@@start_time@@,$start_time,g" \
+    | sbatch
+done
+echo 'Process complete : ' $(date) >> "$LOG"
+
+Will call on the script below
+#!/bin/tcsh
+#SBATCH --job-name=@@sample_name@@
+#SBATCH -N 1
+#SBATCH --ntasks-per-node 10
+#SBATCH -t 48:00:00
+module load miniforge3/24.9.2-0
+conda activate mimulus
+
+set start_time = `date +%s`
+set file = @@file@@
+set REF = @@REF@@
+set outfile = @@outfile@@
+set LOG = @@LOG@@
+
+echo 'Current file:\t\t' $file
+echo 'Output will be:\t\t' $outfile
+
+bowtie2 -p @@NUM_CORES@@ \
+    --local --fast-local \
+    -x $REF \
+    -U "$file" \
+    -S "$outfile" \
+    || echo "Something went wrong with file " $file >> $LOG
+
+set end_time = `date +%s`
+@ elapsed_time = $end_time - $start_time
+@ hours = $elapsed_time / 3600
+@ minutes = ( $elapsed_time % 3600 ) / 60
+@ seconds = $elapsed_time % 60
+echo "Script execution time: $hours hours, $minutes minutes, and $seconds seconds."
+echo $file ' : ' `(date)` >> $LOG
+
+
+This will filter the reads for the Parent files.
+#!/usr/bin/env bash
+set -euo pipefail
+MAIN="/sciclone/data10/akraffetto/F2_cuplut"
+SAM_FILES="$MAIN/2-SAM"
+MAPPED_OUTDIR="$MAIN/3-BAM"
+STATS_DIR="$MAIN/3-BAM/stats"
+LOG="$MAIN/Log_filter_sam_parents.txt"
+TEMPLATE="$MAIN/align_scripts/filter_SAM_parents.tcsh"
+NUM_CORES=10
+echo "Starting : $(date)" > "$LOG"
+for file in "$SAM_FILES"/Cy_parent.sam "$SAM_FILES"/V_parent.sam; do
+    base=${file##*/}
+    sample_name=${base/.sam/}
+    MAPPED_OUT="$MAPPED_OUTDIR/${sample_name}.bam"
+    STATS_OUT="$STATS_DIR/${sample_name}.idxstats.txt"
+    cat "$TEMPLATE" \
+    | sed "s,@@input_sam@@,$file,g" \
+    | sed "s,@@MAPPED_OUT@@,$MAPPED_OUT,g" \
+    | sed "s,@@STATS_OUT@@,$STATS_OUT,g" \
+    | sed "s,@@sample_name@@,$sample_name,g" \
+    | sed "s,@@NUM_CORES@@,$NUM_CORES,g" \
+    | sbatch
+    echo "Submitted $sample_name" >> "$LOG"
+done
+echo 'Process complete : ' $(date) >> "$LOG"
+
+This will call on the following script
+
+#!/bin/tcsh
+#SBATCH --job-name=@@sample_name@@
+#SBATCH -N 1
+#SBATCH --ntasks-per-node 10
+#SBATCH --mem=64G
+#SBATCH -t 24:00:00
+module load miniforge3/24.9.2-0
+conda activate mimulus
+
+echo "Starting filter for @@sample_name@@ : `date`"
+
+samtools view -bS -F 4 -q 20 @@input_sam@@ \
+    | samtools sort -@ @@NUM_CORES@@ -m 4G -n -o @@MAPPED_OUT@@_namesort.bam
+if ($status != 0) then
+    echo "ERROR: view/namesort failed for @@sample_name@@"
+    exit 1
+endif
+
+samtools fixmate -@ @@NUM_CORES@@ -m @@MAPPED_OUT@@_namesort.bam @@MAPPED_OUT@@_fixmate.bam
+if ($status != 0) then
+    echo "ERROR: fixmate failed for @@sample_name@@"
+    exit 1
+endif
+
+samtools sort -@ @@NUM_CORES@@ -m 4G -o @@MAPPED_OUT@@_tmp.bam @@MAPPED_OUT@@_fixmate.bam
+if ($status != 0) then
+    echo "ERROR: coordinate sort failed for @@sample_name@@"
+    exit 1
+endif
+
+samtools markdup -@ @@NUM_CORES@@ @@MAPPED_OUT@@_tmp.bam @@MAPPED_OUT@@
+if ($status != 0) then
+    echo "ERROR: markdup failed for @@sample_name@@"
+    exit 1
+endif
+
+samtools index @@MAPPED_OUT@@
+samtools idxstats --threads @@NUM_CORES@@ @@MAPPED_OUT@@ > @@STATS_OUT@@
+rm @@MAPPED_OUT@@_namesort.bam @@MAPPED_OUT@@_fixmate.bam @@MAPPED_OUT@@_tmp.bam
+echo "Done : `date`"
+
+
+This will filter the F2 reads
+#!/bin/tcsh
+#SBATCH --job-name=@@sample_name@@
+#SBATCH -N 1 --ntasks-per-node 10
+#SBATCH -t 10:00:00
+module load miniforge3/24.9.2-0
+conda activate mimulus
+
+# Convert, filter, sort, mark duplicates, index, stats in one go
+samtools view -bS -F 4 -q 20 @@input_sam@@ \
+    | samtools sort -o @@MAPPED_OUT@@_tmp.bam
+
+samtools markdup @@MAPPED_OUT@@_tmp.bam @@MAPPED_OUT@@
+
+samtools index @@MAPPED_OUT@@
+
+samtools idxstats --threads @@NUM_CORES@@ @@MAPPED_OUT@@ > @@STATS_OUT@@
+
+rm @@MAPPED_OUT@@_tmp.bam
+
+
+This will call on the following script
+#!/usr/bin/env bash
+set -euo pipefail
+
+MAIN="/sciclone/data10/akraffetto/F2_cuplut"
+SAM_FILES="$MAIN/2-SAM"
+MAPPED_OUTDIR="$MAIN/3-BAM"
+STATS_DIR="$MAIN/3-BAM/stats"
+LOG="$MAIN/Log_filter_sam.txt"
+TEMPLATE="$MAIN/align_scripts/filter_SAM_F2.sh"
+NUM_CORES=10
+
+mkdir -p "$MAPPED_OUTDIR" "$STATS_DIR"
+echo "Starting : $(date)" > "$LOG"
+
+for file in "$SAM_FILES"/*.sam; do
+    base=${file##*/}
+    sample_name=${base/.sam/}
+    MAPPED_OUT="$MAPPED_OUTDIR/${sample_name}.bam"
+    STATS_OUT="$STATS_DIR/${sample_name}.idxstats.txt"
+
+    cat "$TEMPLATE" \
+    | sed "s,@@input_sam@@,$file,g" \
+    | sed "s,@@MAPPED_OUT@@,$MAPPED_OUT,g" \
+    | sed "s,@@STATS_OUT@@,$STATS_OUT,g" \
+    | sed "s,@@sample_name@@,$sample_name,g" \
+    | sed "s,@@NUM_CORES@@,$NUM_CORES,g" \
+    | sbatch
+
+    echo "Submitted $sample_name" >> "$LOG"
+done
+
+echo 'Process complete : ' $(date) >> "$LOG"
+
+Next we will take the bamfiles and create a vcf with all of the files.
+
+#!/bin/tcsh
+#SBATCH --job-name=bcftools_F2
+#SBATCH -N 1
+#SBATCH --ntasks-per-node 20
+#SBATCH -t 72:00:00
+module load miniforge3/24.9.2-0
+conda activate mimulus
+
+set BAMFILES="/sciclone/data10/akraffetto/F2_cuplut/bamfiles.txt"
+set REF_FASTA="/sciclone/data10/akraffetto/mimulustest/Mcupreus_genome/Mimulus_cupreus_var_MCY43_V1_release/Mimulus_cupreus_var_MCY43_V1_release/Mimulus_cupreus_var_MCY43/sequences/Mimulus_cupreus_var_MCY43.mainGenome.fasta"
+set THREADS=30
+set OUT_DIR="/sciclone/data10/akraffetto/F2_cuplut/6-MPILEUP"
+
+mkdir -p $OUT_DIR
+
+bcftools mpileup -Ou \
+  -f $REF_FASTA \
+  -b $BAMFILES \
+  -q 20 \
+  -Q 20 \
+  -a AD,DP,SP \
+  --threads $THREADS \
+| bcftools call -mv -Ou --threads $THREADS \
+| bcftools view -Ou -m2 -M2 -v snps \
+| bcftools norm -f $REF_FASTA -Oz -o $OUT_DIR/F2_cuplut_snps.vcf.gz
+
+bcftools index $OUT_DIR/F2_cuplut_snps.vcf.gz
+
+This script takes the vcf and subsets to only sites where the parents are different and filters further
+
+#!/bin/tcsh
+#SBATCH --job-name=bcftools_F2
+#SBATCH -N 1
+#SBATCH --ntasks-per-node 20
+#SBATCH -t 72:00:00
+module load miniforge3/24.9.2-0
+conda activate mimulus
+
+set MAIN = "/sciclone/data10/akraffetto/F2_cuplut/6-MPILEUP"
+set VCF = "$MAIN/F2_cuplut_snps.vcf.gz"
+set LOG = "$MAIN/Log_filter_diagnostic.txt"
+cd "$MAIN"
+
+echo "Starting : `date`" > "$LOG"
+
+# Step 1: clean up sample names
+bcftools query -l "$VCF" | sed 's|.*/||; s|\.bam$||' > clean_names.txt
+bcftools reheader -s clean_names.txt "$VCF" -o F2_cuplut_snps_renamed.vcf.gz
+bcftools index F2_cuplut_snps_renamed.vcf.gz
+set VCF = "$MAIN/F2_cuplut_snps_renamed.vcf.gz"
+echo "Renamed VCF created. Sample count: `bcftools query -l $VCF | wc -l`" >> "$LOG"
+
+# Step 2: parent-diagnostic sites
+bcftools view -s Cy_parent,V_parent "$VCF" -Ou | \
+    bcftools view -m2 -M2 -Ou | \
+    bcftools view -i '(GT[0]="RR" && GT[1]="AA") || (GT[0]="AA" && GT[1]="RR")' \
+    -Oz -o parent_diagnostic_sites.vcf.gz
+bcftools index parent_diagnostic_sites.vcf.gz
+echo "Diagnostic sites found: `bcftools view -H parent_diagnostic_sites.vcf.gz | wc -l`" >> "$LOG"
+
+# Step 3: extract site list
+bcftools query -f '%CHROM\t%POS\n' parent_diagnostic_sites.vcf.gz > diagnostic_sites.txt
+
+# Step 4: sample list excluding blank
+bcftools query -l "$VCF" | grep -v "sample_blank" > samples_noblank.txt
+echo "Samples retained: `wc -l < samples_noblank.txt`" >> "$LOG"
+
+# Step 5: subset full VCF to diagnostic sites, drop blank
+bcftools view -S samples_noblank.txt -R diagnostic_sites.txt "$VCF" \
+    -Oz -o F2_diagnostic_raw.vcf.gz
+bcftools index F2_diagnostic_raw.vcf.gz
+
+# Step 6: missingness + depth filter
+bcftools view -i 'F_MISSING < 0.2' F2_diagnostic_raw.vcf.gz -Ou | \
+    bcftools view -i 'INFO/DP > 100' \
+    -Oz -o F2_diagnostic_filtered.vcf.gz
+bcftools index F2_diagnostic_filtered.vcf.gz
+echo "Final filtered sites: `bcftools view -H F2_diagnostic_filtered.vcf.gz | wc -l`" >> "$LOG"
+echo "Done : `date`" >> "$LOG"
+
+Next file extracts genotypes for the diagnostic ones into a usable format for the r processing.
+
+#!/bin/tcsh
+#SBATCH --job-name=bcftools_F2
+#SBATCH -N 1
+#SBATCH --ntasks-per-node 20
+#SBATCH -t 72:00:00
+module load miniforge3/24.9.2-0
+conda activate mimulus
+
+# ----------------------------------------------------------------------
+# Step 1: pull CHROM/POS + per-sample GT out of the diagnostic VCF with
+# bcftools. 
+# copy/transfer gt_extract.tsv and samples.txt alongside the R script.
+# ----------------------------------------------------------------------
+ 
+set VCF = F2_diagnostic_filtered.vcf.gz
+ 
+bcftools query -l $VCF > samples.txt
+bcftools query -f '%CHROM\t%POS[\t%GT]\n' $VCF > gt_extract.tsv
+ 
+echo "Wrote samples.txt ("`wc -l < samples.txt`" samples) and gt_extract.tsv ("`wc -l < gt_extract.tsv`" sites)"
+
+TAKE TO R-------------------------------------------------------------------------------------------------------------------------------------------
+suppressMessages(library(qtl2))
+
+## ---------------------------------------------------------------------
+## 0. PARAMETERS -- adjust these as needed
+## ---------------------------------------------------------------------
+gt_file         <- "gt_extract.tsv"
+samples_file    <- "samples.txt"
+parent1_name    <- "Cy_parent"     # M. cupreus parent -> "A" allele
+parent2_name    <- "V_parent"      # M. luteus parent  -> "B" allele
+max_ind_missing <- 0.50            # drop F2 individuals missing >50% of raw sites
+bin_size_bp     <- 250000          # window size for consensus super-markers;
+
+max_mar_missing <- 0.40            # drop super-markers missing in >40% of kept F2s
+error_prob      <- 0.02            # genotyping error rate for est_map() --
+
+map_function    <- "kosambi"
+work_dir        <- "qtl2_build"
+out_prefix      <- "Mimulus_F2"
+
+## ---------------------------------------------------------------------
+## 1. READ THE EXTRACTED GENOTYPES
+## ---------------------------------------------------------------------
+samples <- readLines(samples_file)
+
+gt <- read.table(gt_file, header = FALSE, sep = "\t",
+                 colClasses = "character", quote = "")
+colnames(gt) <- c("CHROM", "POS", samples)
+gt$POS <- as.numeric(gt$POS)
+
+cat(sprintf("Read %d sites x %d samples\n", nrow(gt), length(samples)))
+
+stopifnot(parent1_name %in% samples, parent2_name %in% samples)
+
+## ---------------------------------------------------------------------
+## 2. POLARIZE SITES USING THE TWO PARENTS (sanity re-check)
+## ---------------------------------------------------------------------
+p1 <- gt[[parent1_name]]
+p2 <- gt[[parent2_name]]
+
+is_diag <- (p1 == "0/0" & p2 == "1/1") | (p1 == "1/1" & p2 == "0/0")
+cat(sprintf("%d / %d sites are clean parent-diagnostic; dropping %d\n",
+            sum(is_diag), nrow(gt), sum(!is_diag)))
+
+gt  <- gt[is_diag, ]
+p1  <- p1[is_diag]
+p1_is_ref <- p1 == "0/0"
+
+## ---------------------------------------------------------------------
+## 3. RECODE F2 GENOTYPES TO qtl2 LETTER CODES (A / H / B)
+## ---------------------------------------------------------------------
+f2_samples <- setdiff(samples, c(parent1_name, parent2_name))
+cat(sprintf("%d F2 progeny in VCF\n", length(f2_samples)))
+
+recode_one <- function(raw_gt, p1_ref) {
+  out <- rep(NA_character_, length(raw_gt))
+  het <- raw_gt == "0/1" | raw_gt == "1/0"
+  out[het] <- "H"
+  hom_ref <- raw_gt == "0/0"
+  hom_alt <- raw_gt == "1/1"
+  out[hom_ref &  p1_ref] <- "A"
+  out[hom_ref & !p1_ref] <- "B"
+  out[hom_alt &  p1_ref] <- "B"
+  out[hom_alt & !p1_ref] <- "A"
+  out
+}
+
+geno_mat <- sapply(f2_samples, function(s) recode_one(gt[[s]], p1_is_ref))
+rownames(geno_mat) <- paste0(gt$CHROM, "_", gt$POS)
+# geno_mat: raw markers (rows) x individuals (cols), values "A"/"H"/"B"/NA
+
+## ---------------------------------------------------------------------
+## 4. DROP HIGH-MISSINGNESS F2 INDIVIDUALS (assessed on raw markers)
+## ---------------------------------------------------------------------
+ind_miss <- colMeans(is.na(geno_mat))
+drop_ind <- names(ind_miss)[ind_miss > max_ind_missing]
+cat(sprintf("Dropping %d / %d F2 individuals with >%.0f%% missing genotypes\n",
+            length(drop_ind), length(ind_miss), max_ind_missing * 100))
+if (length(drop_ind) > 0) {
+  cat("  Dropped:", paste(drop_ind, collapse = ", "), "\n")
+}
+geno_mat <- geno_mat[, setdiff(colnames(geno_mat), drop_ind), drop = FALSE]
+gt_kept  <- gt   # raw marker table, same row order as geno_mat
+
+cat(sprintf("Raw genotype matrix: %d markers x %d individuals, %.1f%% missing\n",
+            nrow(geno_mat), ncol(geno_mat), 100 * mean(is.na(geno_mat))))
+
+## ---------------------------------------------------------------------
+## 5b. BIN NEARBY MARKERS INTO CONSENSUS "SUPER-MARKERS"
+## ---------------------------------------------------------------------
+majority_vote <- function(x) {
+  x <- x[!is.na(x)]
+  if (length(x) == 0) return(NA_character_)
+  tab <- table(x)
+  top <- names(tab)[tab == max(tab)]
+  if (length(top) > 1) return(NA_character_)   # tie -> ambiguous, drop
+  top
+}
+
+bin_one_chrom <- function(ch) {
+  idx <- which(gt_kept$CHROM == ch)
+  pos <- gt_kept$POS[idx]
+  bin <- floor(pos / bin_size_bp)
+  ubins <- sort(unique(bin))
+  
+  out_geno <- matrix(NA_character_, nrow = length(ubins), ncol = ncol(geno_mat))
+  colnames(out_geno) <- colnames(geno_mat)
+  out_pos <- numeric(length(ubins))
+  out_n   <- integer(length(ubins))
+  
+  for (i in seq_along(ubins)) {
+    rows <- idx[bin == ubins[i]]
+    sub  <- geno_mat[rows, , drop = FALSE]
+    out_geno[i, ] <- apply(sub, 2, majority_vote)
+    out_pos[i] <- mean(pos[bin == ubins[i]])
+    out_n[i]   <- length(rows)
+  }
+  data.frame(chrom = ch, pos = out_pos, n_snps = out_n,
+             bin_idx = ubins, stringsAsFactors = FALSE) -> meta
+  list(geno = out_geno, meta = meta)
+}
+
+chroms <- unique(gt_kept$CHROM)
+binned <- lapply(chroms, bin_one_chrom)
+
+geno_mat_b <- do.call(rbind, lapply(binned, `[[`, "geno"))
+meta_b     <- do.call(rbind, lapply(binned, `[[`, "meta"))
+marker_id_b <- paste0(meta_b$chrom, "_bin", meta_b$bin_idx)
+rownames(geno_mat_b) <- marker_id_b
+
+cat(sprintf("Binned %d raw markers into %d super-markers (bin size = %d bp)\n",
+            nrow(geno_mat), nrow(geno_mat_b), bin_size_bp))
+cat(sprintf("  median SNPs per super-marker: %d, missingness before -> after binning: %.1f%% -> %.1f%%\n",
+            median(meta_b$n_snps), 100 * mean(is.na(geno_mat)), 100 * mean(is.na(geno_mat_b))))
+## ---------------------------------------------------------------------
+## 5. DROP SUPER-MARKERS THAT ARE MONOMORPHIC OR TOO MISSING
+## ---------------------------------------------------------------------
+mar_miss   <- rowMeans(is.na(geno_mat_b))
+n_classes  <- apply(geno_mat_b, 1, function(x) length(unique(x[!is.na(x)])))
+keep_mar   <- mar_miss <= max_mar_missing & n_classes >= 2
+
+cat(sprintf("Dropping %d super-markers (monomorphic or >%.0f%% missing); keeping %d\n",
+            sum(!keep_mar), max_mar_missing * 100, sum(keep_mar)))
+
+geno_mat_b  <- geno_mat_b[keep_mar, , drop = FALSE]
+meta_b      <- meta_b[keep_mar, ]
+marker_id_b <- marker_id_b[keep_mar]
+
+cat("Super-markers retained per chromosome:\n")
+print(table(meta_b$chrom))
+
+## ---------------------------------------------------------------------
+## 6. WRITE qtl2 CSV INPUTS (genotype file is markers-as-rows / "transposed")
+## ---------------------------------------------------------------------
+geno_csv     <- file.path("geno.csv")
+pmap_csv     <- file.path("pmap.csv")
+gmap_csv     <- file.path("gmap.csv")
+control_json <- file.path("control.json")
+
+geno_out <- data.frame(marker = marker_id_b, geno_mat_b, check.names = FALSE,
+                       stringsAsFactors = FALSE)
+write.table(geno_out, geno_csv, sep = ",", row.names = FALSE, quote = FALSE,
+            na = "NA")
+
+pmap_out <- data.frame(marker = marker_id_b,
+                       chr    = meta_b$chrom,
+                       pos    = meta_b$pos / 1e6)   # bp -> Mb
+write.table(pmap_out, pmap_csv, sep = ",", row.names = FALSE, quote = FALSE)
+
+
+gmap_out <- pmap_out
+write.table(gmap_out, gmap_csv, sep = ",", row.names = FALSE, quote = FALSE)
+
+write_control_file(
+  output_file      = control_json,
+  crosstype        = "f2",
+  geno_file        = basename(geno_csv),
+  pmap_file        = basename(pmap_csv),
+  gmap_file        = basename(gmap_csv),
+  alleles          = c("Cy", "V"),
+  geno_codes       = c(A = 1, H = 2, B = 3),
+  na.strings       = c("NA"),
+  geno_transposed  = TRUE,
+  overwrite        = TRUE
+)
+
+## ---------------------------------------------------------------------
+## 7. READ IT BACK IN AS A cross2 OBJECT
+## ---------------------------------------------------------------------
+cross <- read_cross2(control_json)
+print(summary(cross))
+
+## ---------------------------------------------------------------------
+## 8. DROP ANY REMAINING EXACT-DUPLICATE SUPER-MARKERS
+## ---------------------------------------------------------------------
+dup <- find_dup_markers(cross)
+cat(sprintf("Found %d super-markers that are exact genotype-duplicates of another on the same chromosome\n",
+            length(dup)))
+if (length(dup) > 0) {
+  cross <- drop_markers(cross, dup)
+}
+print(summary(cross))
+
+## ---------------------------------------------------------------------
+## 9. ESTIMATE THE GENETIC MAP, ONE CHROMOSOME AT A TIME
+## ---------------------------------------------------------------------
+gmap <- list()
+failed_chroms <- character(0)
+
+for (ch in names(cross$geno)) {
+  n_mar <- ncol(cross$geno[[ch]])
+  n_ind <- nrow(cross$geno[[ch]])
+  cat(sprintf("est_map: %-8s (%4d markers, %3d individuals)... ", ch, n_mar, n_ind))
+  
+  res <- tryCatch({
+    qtl2::est_map(cross[, ch], error_prob = error_prob,
+                  map_function = map_function, cores = 1)
+  }, error = function(e) {
+    cat("FAILED -", conditionMessage(e), "\n")
+    NULL
+  })
+  
+  if (!is.null(res)) {
+    gmap[[ch]] <- res[[1]]
+    cat(sprintf("OK, map length = %.1f cM\n", max(res[[1]])))
+  } else {
+    failed_chroms <- c(failed_chroms, ch)
+  }
+}
+
+if (length(failed_chroms) > 0) {
+  cat("\nThese chromosomes failed est_map():\n  ",
+      paste(failed_chroms, collapse = ", "), "\n", sep = "")
+}
+
+## ---------------------------------------------------------------------
+## 10. SAVE RESULTS
+## ---------------------------------------------------------------------
+saveRDS(cross, paste0(out_prefix, "_cross2.rds"))
+saveRDS(gmap,  paste0(out_prefix, "_gmap.rds"))
+
+pmap_list <- cross$pmap
+
+map_df <- do.call(rbind, lapply(names(gmap), function(ch) {
+  mk <- names(gmap[[ch]])
+  data.frame(chrom  = ch,
+             marker = mk,
+             Mb     = pmap_list[[ch]][mk],
+             cM     = gmap[[ch]][mk],
+             row.names = NULL)
+}))
+write.csv(map_df, paste0(out_prefix, "_physical_vs_genetic.csv"), row.names = FALSE)
+
+cat("\nDone. Wrote:\n  ", out_prefix, "_cross2.rds\n  ",
+    out_prefix, "_gmap.rds\n  ",
+    out_prefix, "_physical_vs_genetic.csv\n", sep = "")
+
