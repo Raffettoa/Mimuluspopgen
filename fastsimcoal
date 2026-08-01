@@ -1,1 +1,101 @@
+##01a_split_vcf.sh ----------------------
 
+#!/bin/bash -l
+#SBATCH --job-name=splitvcf
+#SBATCH --nodes=1
+#SBATCH --ntasks-per-node=8
+#SBATCH -t 08:00:00
+#SBATCH -o /sciclone/data10/akraffetto/mimulustest/cuplut_demography/logs/split_%j.out
+#SBATCH -e /sciclone/data10/akraffetto/mimulustest/cuplut_demography/logs/split_%j.err
+ 
+# STATUS: ALREADY DONE -- WGvariants_nomaf.vcf.gz exists (2,100,624 sites).
+# Makes a variant-only, NO-MAF-FILTER VCF for easySFS (which OOMs on all-sites).
+ 
+module load miniforge3/24.9.2-0
+source "$(conda info --base)/etc/profile.d/conda.sh"
+conda activate mimulus
+ 
+VCF=/sciclone/data10/akraffetto/mimulustest/VCFs/WGinvar.recode.vcf.gz
+OUTV=/sciclone/data10/akraffetto/mimulustest/VCFs/WGvariants_nomaf.vcf.gz
+ 
+which bcftools || { echo "ERROR: bcftools not on PATH"; exit 1; }
+ 
+# AC recomputed from GT (stale --recode INFO not trusted).
+# AC>0 && AC<AN keeps only sites truly polymorphic in this sample set.
+bcftools +fill-tags "$VCF" -Ou -- -t AC,AN \
+  | bcftools view -m2 -M2 -v snps -i 'AC>0 && AC<AN' -Oz -o "$OUTV"
+bcftools index -t "$OUTV"
+echo "=== variant-only sites ==="
+bcftools index -n "$OUTV"
+
+##01b_make_sfs.sh ---------
+
+#!/bin/tcsh
+#SBATCH --job-name=easysfs
+#SBATCH --nodes=1
+#SBATCH --ntasks-per-node=8
+#SBATCH -t 08:00:00
+#SBATCH -o /sciclone/data10/akraffetto/mimulustest/cuplut_demography/logs/sfs_%j.out
+#SBATCH -e /sciclone/data10/akraffetto/mimulustest/cuplut_demography/logs/sfs_%j.err
+
+# 2D FOLDED joint SFS. pop0 = cupreus, pop1 = luteus.
+# SUBMIT TWICE: MODE=preview to pick the projection, then MODE=build.
+
+module load miniforge3/24.9.2-0
+conda activate easySFS
+
+set MODE    = build     # <<< 'preview' then 'build'
+set BASE    = /sciclone/data10/akraffetto/mimulustest/cuplut_demography
+set EASYSFS = /sciclone/data10/akraffetto/mimulustest/software/easySFS/easySFS.py   # <<<
+set VCF     = /sciclone/data10/akraffetto/mimulustest/VCFs/WGvariants_nomaf.vcf.gz
+set POP     = $BASE/popfile_species.txt
+set OUT     = $BASE/sfs_out
+set PROJ    = 40,48       # <<< from the preview, AFTER duplicates are dropped
+
+# TOTAL callable sites = monomorphic + segregating, at the SAME projection.
+# Run 01c_count_mono.sh to get it ('callable' line). easySFS then fills the
+# [0,0] cell itself as (total - segregating), so no manual patching is needed.
+# Leave as 0 to skip (then [0,0] stays a projection artifact and fsc2 CANNOT
+# scale Ne/time to absolute units).
+set TOTLEN  = 22807566           # <<< 'callable' number from 01c
+
+cd $BASE
+mkdir -p $BASE/logs $BASE/01_models
+
+if ( "$MODE" == "preview" ) then
+  echo "=== PREVIEW: pick the value at the PEAK, just before the cliff ==="
+  echo "=== max = 2 x individuals remaining in the popfile ==="
+  python $EASYSFS -i $VCF -p $POP --preview -a -y
+  echo ""
+  echo "Set MODE=build and PROJ=<cupreus>,<luteus>, then resubmit."
+  exit 0
+endif
+
+rm -rf $OUT
+if ( $TOTLEN > 0 ) then
+  echo "=== building WITH --total-length $TOTLEN ==="
+  python $EASYSFS -i $VCF -p $POP --proj $PROJ -a -f -o $OUT -y --total-length $TOTLEN
+else
+  echo "=== WARNING: TOTLEN=0, [0,0] will be a projection artifact ==="
+  python $EASYSFS -i $VCF -p $POP --proj $PROJ -a -f -o $OUT -y
+endif
+
+if ( ! -d $OUT/fastsimcoal2 ) then
+  echo "ERROR: easySFS produced no output (look for 'Killed' = OOM)."
+  exit 1
+endif
+
+ls -l $OUT/fastsimcoal2/
+set JOINT = `ls $OUT/fastsimcoal2/*_jointMAFpop1_0.obs`
+if ( "$JOINT" == "" ) then
+  echo "ERROR: no joint MAF SFS found."
+  exit 1
+endif
+echo "=== joint SFS: $JOINT ==="
+
+foreach mod (SI IM AM SC ADM IMG)
+  cp $JOINT $BASE/01_models/${mod}_jointMAFpop1_0.obs
+end
+ls -l $BASE/01_models/*.obs
+echo ""
+echo "NEXT: if TOTLEN was 0, run 01c_count_mono.sh and rebuild with TOTLEN set."
